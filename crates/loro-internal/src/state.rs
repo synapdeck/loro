@@ -9,7 +9,7 @@ use dead_containers_cache::DeadContainersCache;
 use enum_as_inner::EnumAsInner;
 use enum_dispatch::enum_dispatch;
 use itertools::Itertools;
-use loro_common::{ContainerID, LoroError, LoroResult, TreeID};
+use loro_common::{ContainerID, IdLp, LoroError, LoroResult, TreeID};
 use loro_delta::DeltaItem;
 use rustc_hash::{FxHashMap, FxHashSet};
 use tracing::{info_span, instrument, warn};
@@ -908,6 +908,44 @@ impl DocState {
                 }
             }
         }
+    }
+
+    /// Return the IdLp of the first applied op against the given mergeable
+    /// container, or `None` if no ops have been applied yet.
+    ///
+    /// "First" is determined by total IdLp order (lamport, peer): the op with the smallest IdLp
+    /// among all ops on this container is the container's birth. Used by import-time LWW
+    /// resolution between competing-kind mergeable cids under the same parent key.
+    ///
+    /// Returns `None` for non-mergeable cids, for unknown cids, or when the oplog has no ops
+    /// targeting this container yet.
+    ///
+    /// The caller passes in an `&OpLog` rather than this method acquiring the oplog lock itself:
+    /// the crate-wide order is `oplog -> state`, and callers already hold the state lock to reach
+    /// `&self`.
+    pub fn mergeable_first_op_idlp(&self, oplog: &OpLog, cid: &ContainerID) -> Option<IdLp> {
+        if !cid.is_mergeable() {
+            return None;
+        }
+        let target_idx = self.arena.id_to_idx(cid)?;
+        let mut best: Option<IdLp> = None;
+        oplog.change_store().visit_all_changes(&mut |change| {
+            let base_counter = change.id.counter;
+            let base_lamport = change.lamport;
+            let peer = change.id.peer;
+            for op in change.ops.iter() {
+                if op.container != target_idx {
+                    continue;
+                }
+                let lamport = base_lamport + (op.counter - base_counter) as crate::change::Lamport;
+                let idlp = IdLp::new(peer, lamport);
+                best = Some(match best {
+                    Some(cur) if cur <= idlp => cur,
+                    _ => idlp,
+                });
+            }
+        });
+        best
     }
 
     pub(crate) fn get_value_by_idx(&mut self, container_idx: ContainerIdx) -> LoroValue {
