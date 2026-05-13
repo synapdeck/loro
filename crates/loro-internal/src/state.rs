@@ -510,6 +510,7 @@ impl DocState {
         &mut self,
         mut diff: InternalDocDiff<'static>,
         diff_mode: DiffMode,
+        oplog: &OpLog,
     ) -> LoroResult<()> {
         if self.in_txn {
             return Err(LoroError::TransactionError(
@@ -747,7 +748,7 @@ impl DocState {
         // locally calling `get_mergeable_*` — would have the child in KV but missing from the
         // side table that drives deep-value walks, path resolution, and child enumeration.
         if !mergeable_to_register.is_empty() {
-            self.register_mergeable_children(mergeable_to_register);
+            self.register_mergeable_children(oplog, mergeable_to_register);
         }
 
         if self.is_recording() {
@@ -865,7 +866,7 @@ impl DocState {
     /// snapshot decode so the imported doc's deep value, path lookups, and
     /// reachability checks see mergeable children without requiring the caller
     /// to re-invoke `get_mergeable_*` on every nested key.
-    fn repopulate_mergeable_child_side_tables(&mut self) {
+    fn repopulate_mergeable_child_side_tables(&mut self, oplog: &OpLog) {
         // Collect all mergeable cids first so we don't hold an iterator borrow
         // while mutating MapStates below.
         let mergeable: Vec<ContainerID> = self
@@ -873,7 +874,7 @@ impl DocState {
             .iter_all_container_ids()
             .filter(|id| id.is_mergeable())
             .collect();
-        self.register_mergeable_children(mergeable);
+        self.register_mergeable_children(oplog, mergeable);
     }
 
     /// Register each mergeable cid in `cids` under its parent MapState
@@ -884,7 +885,15 @@ impl DocState {
     /// iterator. The work is idempotent: calling it twice with the same cid
     /// is a no-op on the second call (`register_mergeable_child` inserts into
     /// a HashMap keyed by cid).
-    fn register_mergeable_children(&mut self, cids: impl IntoIterator<Item = ContainerID>) {
+    fn register_mergeable_children(
+        &mut self,
+        oplog: &OpLog,
+        cids: impl IntoIterator<Item = ContainerID>,
+    ) {
+        // Pass 1: group cids by (parent_id, key). Each group represents a
+        // potential conflict (one cid per kind under the same parent/key).
+        let mut by_key: FxHashMap<(ContainerID, InternalString), Vec<ContainerID>> =
+            FxHashMap::default();
         for cid in cids {
             if !cid.is_mergeable() {
                 continue;
@@ -892,6 +901,64 @@ impl DocState {
             let Some((parent_id, key, _kind)) = cid.parse_mergeable() else {
                 continue;
             };
+            by_key.entry((parent_id, key.into())).or_default().push(cid);
+        }
+
+        // Augment each group with any mergeable cids ALREADY registered under
+        // the same (parent, key) on the parent MapState's side table. This is
+        // critical for the update-import path: the incoming diff batch only
+        // carries newly-arrived cids, but a local pre-existing cid of a
+        // competing kind must still be considered as a candidate so the LWW
+        // resolver makes a correct, full-information decision.
+        for ((parent_id, key), candidates) in by_key.iter_mut() {
+            let Some(parent_idx) = self.arena.id_to_idx(parent_id) else {
+                continue;
+            };
+            let Some(state) = self.store.get_container_mut(parent_idx) else {
+                continue;
+            };
+            let Some(map) = state.as_map_state_mut() else {
+                continue;
+            };
+            for existing in map.mergeable_child_ids_for_key(key) {
+                if !candidates.iter().any(|c| c == &existing) {
+                    candidates.push(existing);
+                }
+            }
+        }
+
+        // Pass 2: for each group, look up first-op IdLp per cid (read-only on `self.store` and
+        // `oplog`), then pick the LWW winner. Cids with no ops yet (`None` from
+        // `mergeable_first_op_idlp`) defer — they aren't registered; their conflict, if any, will
+        // be re-resolved once ops arrive. This preserves the invariant that an unmutated
+        // mergeable child does not round-trip through a snapshot.
+        let mut decisions: Vec<(ContainerID, InternalString, ContainerID)> = Vec::new();
+        for ((parent_id, key), candidates) in by_key {
+            // Decorate each candidate with its first-op IdLp.
+            let mut with_idlp: Vec<(ContainerID, Option<IdLp>)> = candidates
+                .into_iter()
+                .map(|cid| {
+                    let idlp = self.mergeable_first_op_idlp(oplog, &cid);
+                    (cid, idlp)
+                })
+                .collect();
+
+            // Filter to cids that have an applied op (Some(idlp)). Unmutated
+            // competitors defer: skip registration entirely.
+            with_idlp.retain(|(_, idlp)| idlp.is_some());
+
+            if with_idlp.is_empty() {
+                continue;
+            }
+
+            // Sort by IdLp ascending; the LAST one (max IdLp) is the LWW winner.
+            with_idlp.sort_by_key(|(_, idlp)| *idlp);
+            let (winner, _) = with_idlp.pop().unwrap();
+            decisions.push((parent_id, key, winner));
+        }
+
+        // Pass 3: register the winners (mutates self.store and self.arena).
+        for (parent_id, key, winner) in decisions {
             // Ensure the parent container exists in the store; it normally
             // does (the mergeable child was created by writing to it), but
             // `ensure_container` is idempotent and cheap when present.
@@ -900,11 +967,14 @@ impl DocState {
             // Also make sure the arena parent edge is wired. Re-registering
             // the mergeable cid is idempotent and will set the parent via
             // `parse_mergeable` if it wasn't already set.
-            self.arena.register_container(&cid);
+            self.arena.register_container(&winner);
 
             if let Some(state) = self.store.get_container_mut(parent_idx) {
                 if let Some(map) = state.as_map_state_mut() {
-                    map.register_mergeable_child(key.into(), cid);
+                    // Use the LWW-aware variant: any competing-kind mergeable
+                    // cid previously registered under this key is evicted so
+                    // exactly one survives per (parent, key).
+                    map.replace_mergeable_child_for_key(key, winner);
                 }
             }
         }
@@ -989,7 +1059,7 @@ impl DocState {
         // container IDs, find the mergeable ones, and call
         // `register_mergeable_child` on their parent MapStates to rebuild
         // that side table from the deterministic cids.
-        self.repopulate_mergeable_child_side_tables();
+        self.repopulate_mergeable_child_side_tables(oplog);
 
         if !unknown_containers.is_empty() {
             let mut diff_calc = DiffCalculator::new(false);
@@ -1017,6 +1087,7 @@ impl DocState {
                     new_version: Cow::Owned(frontiers.clone()),
                 },
                 DiffMode::Checkout,
+                oplog,
             )?;
         }
 

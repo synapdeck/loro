@@ -519,15 +519,15 @@ fn snapshot_import_different_type_collision_is_observable() {
     let result = b.import(&snapshot);
     assert!(result.is_ok(), "import itself must not fail; got {result:?}");
 
-    // Both mergeable cids exist in the store. Re-invoking get_mergeable_*
-    // for either kind now fails with type-mismatch ArgErr, because the
-    // pre-existing side-table entry blocks the other kind.
-    let err = b.get_map("state").get_mergeable_text("k").err();
-    let err2 = b.get_map("state").get_mergeable_map("k").err();
-    assert!(
-        err.is_some() || err2.is_some(),
-        "at least one kind must now be locked out: text_err={err:?}, map_err={err2:?}"
-    );
+    // After LWW at import, exactly one kind survives; the other errors with kind-mismatch.
+    let text_result = b.get_map("state").get_mergeable_text("k");
+    let map_result = b.get_map("state").get_mergeable_map("k");
+    let surviving = match (&text_result, &map_result) {
+        (Ok(_), Err(_)) => "Text",
+        (Err(_), Ok(_)) => "Map",
+        other => panic!("expected exactly one kind to survive, got {other:?}"),
+    };
+    println!("Different-type LWW resolution: {surviving} won");
 }
 
 /// `parse_mergeable` is a pure decoder and must return `None` (not panic, not
@@ -964,4 +964,82 @@ fn mergeable_first_op_idlp_lookup() {
     }
     .expect("second-op state still has a first-op IdLp");
     assert_eq!(post2, post, "first-op IdLp is stable across later ops");
+}
+
+/// When two competing-kind mergeable cids land in the same parent's side
+/// table under the same key during import (snapshot or update), the LWW
+/// resolver picks the one with the higher first-op IdLp. The loser's
+/// cid is NOT registered on the parent MapState. The loser's container
+/// state remains in KV (orphaned, no parent edge in the side table).
+#[test]
+#[cfg(feature = "counter")]
+fn lww_resolves_different_type_collision_at_import() {
+    // Peer A: text under "k", incremented at low lamport.
+    let a = doc(1);
+    let a_text = a.get_map("state").get_mergeable_text("k").unwrap();
+    a_text.insert(0, "from_a", PosType::Unicode).unwrap();
+    a.commit_then_renew();
+
+    // Peer B: map under "k", with a *later* op (we use unrelated ops first
+    // to advance B's lamport clock past A's text op).
+    let b = doc(2);
+    let b_state = b.get_map("state");
+    // Force B's lamport clock to advance.
+    for i in 0..5 {
+        b_state.insert(&format!("filler_{i}"), i).unwrap();
+        b.commit_then_renew();
+    }
+    let b_map = b_state.get_mergeable_map("k").unwrap();
+    b_map.insert("from_b", true).unwrap();
+    b.commit_then_renew();
+
+    // Verify the lamport ordering precondition for the test.
+    let a_first = {
+        let oplog = a.oplog().lock();
+        let state = a.app_state().lock();
+        state.mergeable_first_op_idlp(&oplog, &a_text.id())
+    }
+    .expect("A's text must have a first-op IdLp");
+    let b_first = {
+        let oplog = b.oplog().lock();
+        let state = b.app_state().lock();
+        state.mergeable_first_op_idlp(&oplog, &b_map.id())
+    }
+    .expect("B's map must have a first-op IdLp");
+    assert!(
+        b_first > a_first,
+        "test precondition: B's first op (idlp={b_first:?}) must be later than A's (idlp={a_first:?})"
+    );
+
+    // B imports A's snapshot. LWW should keep B's map (higher first-op
+    // IdLp) and orphan A's text.
+    let snapshot = a.export(ExportMode::Snapshot).unwrap();
+    b.import(&snapshot).unwrap();
+
+    // B's deep value still shows the map content; not the text.
+    let value = b.get_deep_value().to_json_value();
+    let state_obj = &value["state"];
+    assert!(state_obj.get("k").is_some(), "k must be present");
+    let k_value = &state_obj["k"];
+    assert!(
+        k_value.is_object(),
+        "k must be a Map (B's kind won), got {k_value:?}"
+    );
+    assert_eq!(k_value["from_b"], json!(true));
+
+    // Calling get_mergeable_text("k") on B now errors (B's side table
+    // registers Map under "k"; asking for Text mismatches).
+    let err = b
+        .get_map("state")
+        .get_mergeable_text("k")
+        .expect_err("Text on a Map-resolved key must error");
+    assert!(
+        format!("{err:?}").contains("Expected value type")
+            || format!("{err:?}").contains("Mergeable key"),
+        "expected ArgErr for kind mismatch; got {err:?}"
+    );
+
+    // Calling get_mergeable_map("k") still succeeds and returns the same cid.
+    let b_map_again = b.get_map("state").get_mergeable_map("k").unwrap();
+    assert_eq!(b_map_again.id(), b_map.id());
 }

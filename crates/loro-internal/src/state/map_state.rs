@@ -276,6 +276,23 @@ impl MapState {
         self.child_containers.insert(id, key);
     }
 
+    /// LWW-resolver-friendly variant of [`Self::register_mergeable_child`].
+    /// Removes any previously-registered mergeable cids under the same `key`
+    /// (competing-kind losers) and inserts `id` as the sole survivor.
+    ///
+    /// Non-mergeable child entries under the same key (if any) are left
+    /// untouched: those are normal containers tracked through `MapSet`, not
+    /// through the mergeable side table.
+    pub(crate) fn replace_mergeable_child_for_key(&mut self, key: InternalString, id: ContainerID) {
+        debug_assert!(
+            id.is_mergeable(),
+            "replace_mergeable_child_for_key must only be called with mergeable container ids"
+        );
+        self.child_containers
+            .retain(|cid, k| !(cid.is_mergeable() && *k == key));
+        self.child_containers.insert(id, key);
+    }
+
     /// Iterate `(key, cid)` pairs for mergeable children registered on this
     /// map via [`Self::register_mergeable_child`]. Used by the deep-value walk
     /// to nest mergeable child containers under their logical parent key.
@@ -286,6 +303,17 @@ impl MapState {
             .iter()
             .filter(|(id, _)| id.is_mergeable())
             .map(|(id, key)| (key, id))
+    }
+
+    /// Return every mergeable cid currently registered under `key`. Normally
+    /// at most one survives after the import-time LWW resolver runs; multiple
+    /// can be transiently present mid-resolution.
+    pub(crate) fn mergeable_child_ids_for_key(&self, key: &InternalString) -> Vec<ContainerID> {
+        self.child_containers
+            .iter()
+            .filter(|(id, k)| id.is_mergeable() && *k == key)
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     /// Return the cid of the mergeable child currently registered under `key`,

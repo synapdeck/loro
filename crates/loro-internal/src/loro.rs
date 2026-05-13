@@ -679,6 +679,7 @@ impl LoroDoc {
                         new_version: Cow::Owned(oplog.frontiers().clone()),
                     },
                     diff_mode,
+                    &oplog,
                 ) {
                     oplog.rollback_import();
                     return Err(e);
@@ -786,6 +787,7 @@ impl LoroDoc {
                     new_version: Cow::Owned(oplog.frontiers().clone()),
                 },
                 diff_mode,
+                &oplog,
             ) {
                 if rollback_enabled {
                     oplog.rollback_import();
@@ -1633,6 +1635,7 @@ impl LoroDoc {
                 new_version: Cow::Owned(frontiers.clone()),
             },
             diff_mode,
+            &oplog,
         )?;
 
         Ok(())
