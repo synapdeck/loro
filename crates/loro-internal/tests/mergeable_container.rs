@@ -656,3 +656,35 @@ fn nested_mergeable_concurrent_counter_converges() {
         ]
     );
 }
+
+/// For each supported container kind, `new_mergeable` produces a deterministic
+/// cid that decodes back to the same `(parent, key, kind)`. Counter is gated
+/// on the feature; the rest are unconditional.
+#[test]
+fn mergeable_cid_roundtrips_for_every_container_kind() {
+    use loro_common::{ContainerID, ContainerType};
+    let parent = ContainerID::new_root("state", ContainerType::Map);
+
+    let mut kinds: Vec<ContainerType> = vec![
+        ContainerType::Map,
+        ContainerType::List,
+        ContainerType::MovableList,
+        ContainerType::Text,
+        ContainerType::Tree,
+    ];
+    #[cfg(feature = "counter")]
+    kinds.push(ContainerType::Counter);
+
+    for kind in kinds {
+        let cid = ContainerID::new_mergeable(&parent, "field", kind);
+        assert!(cid.is_mergeable(), "kind {kind:?}: must be mergeable");
+        let again = ContainerID::new_mergeable(&parent, "field", kind);
+        assert_eq!(cid, again, "kind {kind:?}: cid must be deterministic");
+        let (decoded_parent, decoded_key, decoded_kind) = cid
+            .parse_mergeable()
+            .unwrap_or_else(|| panic!("kind {kind:?}: parse_mergeable returned None"));
+        assert_eq!(decoded_parent, parent, "kind {kind:?}: parent roundtrip");
+        assert_eq!(decoded_key, "field", "kind {kind:?}: key roundtrip");
+        assert_eq!(decoded_kind, kind, "kind {kind:?}: kind roundtrip");
+    }
+}
