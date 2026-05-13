@@ -328,3 +328,42 @@ fn parent_map_subscription_receives_mergeable_child_events() {
         "parent map subscriber should see an event whose path includes the mergeable child's key 'revision'; got {captured:?}",
     );
 }
+
+/// Peer B imports updates that originated from peer A's `get_mergeable_counter`
+/// + `increment` calls, but peer B never locally called `get_mergeable_*`.
+/// After import, peer B's deep value, container enumeration, and path
+/// resolution for the mergeable child must all reflect the imported state.
+#[test]
+#[cfg(feature = "counter")]
+fn update_import_populates_mergeable_side_table_on_receiver() {
+    let a = doc(1);
+    let b = doc(2);
+
+    let a_counter = a.get_map("state").get_mergeable_counter("revision").unwrap();
+    a_counter.increment(5.0).unwrap();
+    a.commit_then_renew();
+
+    // Peer B imports A's updates WITHOUT first calling get_mergeable_counter.
+    let updates = a.export(ExportMode::updates(&b.oplog_vv())).unwrap();
+    b.import(&updates).unwrap();
+
+    assert_eq!(
+        b.get_deep_value().to_json_value(),
+        json!({ "state": { "revision": 5.0 } }),
+        "after update import, peer B's deep value must include the mergeable child"
+    );
+
+    // Peer B then locally resolves the mergeable handler — this must return
+    // the same cid as the one peer A wrote, and the existing value.
+    let b_counter = b.get_map("state").get_mergeable_counter("revision").unwrap();
+    assert_eq!(b_counter.id(), a_counter.id());
+    assert_eq!(b_counter.get_value().to_json_value(), json!(5.0));
+
+    // Path resolution from peer B's side must walk through the parent map.
+    let path = b.get_path_to_container(&b_counter.id()).expect("path");
+    let indexes = path.iter().map(|(_, idx)| idx.clone()).collect::<Vec<_>>();
+    assert_eq!(
+        indexes,
+        vec![Index::Key("state".into()), Index::Key("revision".into())]
+    );
+}

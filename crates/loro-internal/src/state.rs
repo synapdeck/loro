@@ -576,6 +576,17 @@ impl DocState {
         // Suppose A is revived and B is A's child, and B also needs to be revived; therefore,
         // we should process each level alternately.
 
+        // Capture mergeable cids in this diff batch BEFORE the main loop mutates `diffs`. After
+        // the loop completes we register them in their parent MapState's `child_containers` side
+        // table, so update imports populate the same side table that snapshot imports rebuild via
+        // `repopulate_mergeable_child_side_tables`. Only cids present in this batch are scanned
+        // (not all known cids), keeping update-import cost proportional to the diff size.
+        let mergeable_to_register: Vec<ContainerID> = diffs
+            .iter()
+            .filter_map(|d| self.arena.idx_to_id(d.idx))
+            .filter(|id| id.is_mergeable())
+            .collect();
+
         // We need to ensure diff is processed in order
         diffs.sort_by_cached_key(|diff| self.arena.get_depth(diff.idx));
         let mut to_revive_in_next_layer: FxHashSet<ContainerIdx> = FxHashSet::default();
@@ -728,6 +739,17 @@ impl DocState {
 
         diff.diff = diffs.into();
         self.frontiers = diff.new_version.clone().into_owned();
+
+        // Register mergeable children that arrived via this diff batch in their parent
+        // MapState's `child_containers` side table. This is the update-import counterpart of
+        // `repopulate_mergeable_child_side_tables` (which fires on snapshot import). Without it,
+        // a peer that imports updates carrying a mergeable child container — without first
+        // locally calling `get_mergeable_*` — would have the child in KV but missing from the
+        // side table that drives deep-value walks, path resolution, and child enumeration.
+        if !mergeable_to_register.is_empty() {
+            self.register_mergeable_children(mergeable_to_register);
+        }
+
         if self.is_recording() {
             self.record_diff(diff)
         }
@@ -851,8 +873,22 @@ impl DocState {
             .iter_all_container_ids()
             .filter(|id| id.is_mergeable())
             .collect();
+        self.register_mergeable_children(mergeable);
+    }
 
-        for cid in mergeable {
+    /// Register each mergeable cid in `cids` under its parent MapState
+    /// `child_containers` side table. Shared body for both the snapshot
+    /// recovery walk and the update-import path in `apply_diff`.
+    ///
+    /// Non-mergeable cids are silently ignored, so callers may pass a mixed
+    /// iterator. The work is idempotent: calling it twice with the same cid
+    /// is a no-op on the second call (`register_mergeable_child` inserts into
+    /// a HashMap keyed by cid).
+    fn register_mergeable_children(&mut self, cids: impl IntoIterator<Item = ContainerID>) {
+        for cid in cids {
+            if !cid.is_mergeable() {
+                continue;
+            }
             let Some((parent_id, key, _kind)) = cid.parse_mergeable() else {
                 continue;
             };
