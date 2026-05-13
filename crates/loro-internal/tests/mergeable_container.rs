@@ -430,3 +430,34 @@ fn post_merge_concurrent_counter_increments_converge() {
     assert_eq!(a.get_deep_value().to_json_value(), expected);
     assert_eq!(b.get_deep_value().to_json_value(), expected);
 }
+
+/// Create a mergeable counter but never mutate it, then export a snapshot.
+/// An unmutated mergeable child has no KV-backed state to anchor the recovery
+/// walk, so it does not round-trip through a snapshot. The receiving peer
+/// sees an empty parent map and can re-create the same deterministic cid by
+/// calling `get_mergeable_*` locally.
+#[test]
+#[cfg(feature = "counter")]
+fn empty_mergeable_child_after_snapshot_import() {
+    let a = doc(1);
+    let _counter = a.get_map("state").get_mergeable_counter("revision").unwrap();
+    // Deliberately no increment. Commit anyway so any pending state is flushed.
+    a.commit_then_renew();
+
+    let snapshot = a.export(ExportMode::Snapshot).unwrap();
+    let b = doc(2);
+    b.import(&snapshot).unwrap();
+
+    // An unmutated mergeable child does NOT round-trip through a snapshot because it has no
+    // KV-backed state to anchor the recovery walk. Peer B's deep value sees an empty `state`
+    // map; re-invoking `get_mergeable_counter` on B re-creates the same cid deterministically.
+    assert_eq!(
+        b.get_deep_value().to_json_value(),
+        json!({ "state": {} }),
+        "unmutated mergeable child must not appear in deep value after snapshot import",
+    );
+
+    let b_counter = b.get_map("state").get_mergeable_counter("revision").unwrap();
+    assert_eq!(b_counter.id(), _counter.id(), "cid still deterministic");
+    assert_eq!(b_counter.get_value().to_json_value(), json!(0.0));
+}
