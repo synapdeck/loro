@@ -282,9 +282,10 @@ fn mergeable_type_mismatch_returns_arg_error() {
     root.get_mergeable_text("field").unwrap();
 
     let err = root.get_mergeable_map("field").unwrap_err();
+    let msg = format!("{err:?}");
     assert!(
-        format!("{err:?}").contains("Expected value type"),
-        "expected ArgErr describing the type mismatch; got {err:?}"
+        msg.contains("Mergeable key") && msg.contains("Map") && msg.contains("Text"),
+        "expected ArgErr describing the mergeable type mismatch; got {msg}"
     );
 }
 
@@ -707,9 +708,10 @@ fn type_mismatch_rejected_after_snapshot_registers_the_key() {
     // Mergeable child for "k" is now registered on B as Text via the
     // recovery walk. Asking for a Map under "k" must error.
     let err = b.get_map("state").get_mergeable_map("k").unwrap_err();
+    let msg = format!("{err:?}");
     assert!(
-        format!("{err:?}").contains("Expected value type"),
-        "expected ArgErr after snapshot-registered mergeable child blocks a different kind; got {err:?}"
+        msg.contains("Mergeable key") && msg.contains("Map") && msg.contains("Text"),
+        "expected ArgErr after snapshot-registered mergeable child blocks a different kind; got {msg}"
     );
 
     // Asking for Text under "k" still works and resolves the same cid.
@@ -1134,5 +1136,44 @@ fn lww_unmutated_competitors_defer_resolution() {
         value,
         json!({ "state": { "k": "from_a" } }),
         "after A's op, A's text wins; B's unmutated map loses; got {value}"
+    );
+}
+
+/// After LWW resolution at import populates the side table from a remote
+/// peer's claim, a local `get_mergeable_<loser_kind>` should error with a
+/// message that mentions the cause is a resolved conflict (not just a
+/// local type-mismatch).
+#[test]
+#[cfg(feature = "counter")]
+fn type_mismatch_error_mentions_lww_resolution() {
+    // Setup: B imports A's snapshot containing a Text under "k"; B has
+    // never locally registered "k". After import, B's side table has
+    // a Text entry under "k" via the recovery walk.
+    let a = doc(1);
+    let a_text = a.get_map("state").get_mergeable_text("k").unwrap();
+    a_text.insert(0, "x", PosType::Unicode).unwrap();
+    a.commit_then_renew();
+    let snapshot = a.export(ExportMode::Snapshot).unwrap();
+
+    let b = doc(2);
+    b.import(&snapshot).unwrap();
+
+    let err = b.get_map("state").get_mergeable_map("k").unwrap_err();
+    let msg = format!("{err:?}");
+
+    // The error should mention both kinds (Map and Text), and indicate
+    // that the conflict was resolved by import/LWW/concurrent write
+    // (i.e., not just a local type-mismatch).
+    assert!(
+        msg.contains("Map") && msg.contains("Text"),
+        "error must mention both the requested kind (Map) and the resolved kind (Text); got {msg}"
+    );
+    assert!(
+        msg.to_lowercase().contains("resolved")
+            || msg.to_lowercase().contains("lww")
+            || msg.to_lowercase().contains("concurrent")
+            || msg.to_lowercase().contains("import")
+            || msg.to_lowercase().contains("mergeable"),
+        "error must hint at LWW/import-time resolution or mergeable context; got {msg}"
     );
 }

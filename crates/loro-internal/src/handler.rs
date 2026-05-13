@@ -4236,9 +4236,9 @@ impl MapHandler {
                     if existing_id.container_type() != child.kind() {
                         return Err(LoroError::ArgErr(
                             format!(
-                                "Expected value type {} but found {}",
+                                "Mergeable key resolved to type {} (via local creation or import-time LWW); cannot return type {}",
+                                existing_id.container_type(),
                                 child.kind(),
-                                existing_id.container_type()
                             )
                             .into_boxed_str(),
                         ));
