@@ -529,3 +529,56 @@ fn snapshot_import_different_type_collision_is_observable() {
         "at least one kind must now be locked out: text_err={err:?}, map_err={err2:?}"
     );
 }
+
+/// `parse_mergeable` is a pure decoder and must return `None` (not panic, not
+/// silently misinterpret) for every malformed payload. This guards against
+/// future drift in the encoder + decoder pair.
+#[test]
+#[cfg(feature = "counter")]
+fn parse_mergeable_rejects_malformed_payloads() {
+    use loro_common::{ContainerID, ContainerType};
+
+    // Non-mergeable root: returns None.
+    let plain_root = ContainerID::new_root("ordinary", ContainerType::Map);
+    assert!(plain_root.parse_mergeable().is_none());
+
+    // Mergeable prefix but invalid hex.
+    let bad_hex = ContainerID::Root {
+        name: "🤝:zzzz".into(),
+        container_type: ContainerType::Counter,
+    };
+    assert!(bad_hex.parse_mergeable().is_none(),
+        "non-hex chars in payload must reject");
+
+    // Mergeable prefix, valid hex, but truncated (no segments).
+    let truncated = ContainerID::Root {
+        name: "🤝:".into(),
+        container_type: ContainerType::Counter,
+    };
+    assert!(truncated.parse_mergeable().is_none(),
+        "empty payload must reject");
+
+    // Mergeable prefix, valid hex, but trailing garbage after the type byte.
+    let parent = ContainerID::new_root("state", ContainerType::Map);
+    let cid = ContainerID::new_mergeable(&parent, "k", ContainerType::Counter);
+    let mut name = match &cid {
+        ContainerID::Root { name, .. } => name.to_string(),
+        _ => panic!("expected Root"),
+    };
+    name.push_str("ff"); // append one extra byte's worth of hex
+    let with_garbage = ContainerID::Root {
+        name: name.into(),
+        container_type: ContainerType::Counter,
+    };
+    assert!(with_garbage.parse_mergeable().is_none(),
+        "trailing bytes after type byte must reject");
+
+    // Mergeable prefix and a payload that decodes correctly, BUT the
+    // encoded type byte disagrees with the Root's container_type field.
+    let mismatched = ContainerID::Root {
+        name: match &cid { ContainerID::Root { name, .. } => name.clone(), _ => unreachable!() },
+        container_type: ContainerType::Map, // payload says Counter
+    };
+    assert!(mismatched.parse_mergeable().is_none(),
+        "type-byte mismatch with Root.container_type must reject");
+}
