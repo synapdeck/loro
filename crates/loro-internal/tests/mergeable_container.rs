@@ -818,3 +818,28 @@ fn shallow_snapshot_roundtrip_preserves_mergeable_child() {
         "shallow snapshot must carry mergeable child state and side-table reconstruction"
     );
 }
+
+/// Mutations on a mergeable child must be undoable. Undoing reverts the
+/// child's value; the side-table registration persists (because it isn't
+/// itself an op).
+#[test]
+#[cfg(feature = "counter")]
+fn undo_manager_reverts_mergeable_counter_mutation() {
+    use loro_internal::UndoManager;
+
+    let doc = doc(1);
+    let counter = doc.get_map("state").get_mergeable_counter("revision").unwrap();
+    let undo = UndoManager::new(&doc);
+
+    counter.increment(5.0).unwrap();
+    doc.commit_then_renew();
+    assert_eq!(counter.get_value().to_json_value(), json!(5.0));
+
+    let did_undo = undo.undo().expect("undo must succeed");
+    assert!(did_undo, "undo must report it did something");
+
+    // The mergeable child still exists (registration is not an op), but its
+    // value is back to zero.
+    assert_eq!(counter.get_value().to_json_value(), json!(0.0),
+        "undo must revert the increment");
+}
