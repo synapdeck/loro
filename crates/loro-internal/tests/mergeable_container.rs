@@ -400,3 +400,33 @@ fn three_peer_mergeable_counter_convergence() {
     assert_eq!(b.get_deep_value().to_json_value(), expected);
     assert_eq!(c.get_deep_value().to_json_value(), expected);
 }
+
+/// After A and B sync once, both peers concurrently mutate the same
+/// mergeable counter again, then sync. Convergence must hold on the second
+/// round — the deterministic cid plus CRDT merge must keep working after
+/// the side table has been populated and used.
+#[test]
+#[cfg(feature = "counter")]
+fn post_merge_concurrent_counter_increments_converge() {
+    let a = doc(1);
+    let b = doc(2);
+
+    let a_counter = a.get_map("state").get_mergeable_counter("revision").unwrap();
+    let b_counter = b.get_map("state").get_mergeable_counter("revision").unwrap();
+    a_counter.increment(1.0).unwrap();
+    b_counter.increment(1.0).unwrap();
+    sync(&a, &b);
+    assert_eq!(
+        a.get_deep_value().to_json_value(),
+        json!({ "state": { "revision": 2.0 } })
+    );
+
+    // Round 2: concurrent edits on the already-merged child.
+    a_counter.increment(10.0).unwrap();
+    b_counter.increment(100.0).unwrap();
+    sync(&a, &b);
+
+    let expected = json!({ "state": { "revision": 112.0 } });
+    assert_eq!(a.get_deep_value().to_json_value(), expected);
+    assert_eq!(b.get_deep_value().to_json_value(), expected);
+}
