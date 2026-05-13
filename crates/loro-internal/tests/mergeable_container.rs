@@ -1,5 +1,6 @@
 use loro_internal::{
-    cursor::PosType, handler::ValueOrHandler, loro::ExportMode, ContainerType, LoroDoc, ToJson,
+    cursor::PosType, handler::ValueOrHandler, loro::ExportMode, ContainerType, HandlerTrait,
+    LoroDoc, ToJson,
 };
 use serde_json::json;
 
@@ -27,6 +28,16 @@ fn concurrent_counter_increments_show_current_lost_update_bug() {
 
     let a_counter = a_root.get_mergeable_counter("revision").unwrap();
     let b_counter = b_root.get_mergeable_counter("revision").unwrap();
+
+    assert_eq!(
+        a_counter.id(),
+        b_counter.id(),
+        "both peers should produce the same deterministic cid"
+    );
+    assert!(
+        a_counter.id().is_mergeable(),
+        "counter cid should be in the mergeable namespace"
+    );
 
     a_counter.increment(1.0).unwrap();
     b_counter.increment(1.0).unwrap();
@@ -64,6 +75,16 @@ fn concurrent_text_updates_show_current_lost_update_bug() {
     let a_text = a.get_map("state").get_mergeable_text("notes").unwrap();
     let b_text = b.get_map("state").get_mergeable_text("notes").unwrap();
 
+    assert_eq!(
+        a_text.id(),
+        b_text.id(),
+        "both peers should produce the same deterministic cid"
+    );
+    assert!(
+        a_text.id().is_mergeable(),
+        "text cid should be in the mergeable namespace"
+    );
+
     a_text.insert(0, "A", PosType::Unicode).unwrap();
     b_text.insert(0, "B", PosType::Unicode).unwrap();
     sync(&a, &b);
@@ -82,6 +103,16 @@ fn concurrent_list_inserts_show_current_lost_update_bug() {
     let b = doc(2);
     let a_list = a.get_map("state").get_mergeable_list("items").unwrap();
     let b_list = b.get_map("state").get_mergeable_list("items").unwrap();
+
+    assert_eq!(
+        a_list.id(),
+        b_list.id(),
+        "both peers should produce the same deterministic cid"
+    );
+    assert!(
+        a_list.id().is_mergeable(),
+        "list cid should be in the mergeable namespace"
+    );
 
     a_list.insert(0, "A").unwrap();
     b_list.insert(0, "B").unwrap();
@@ -127,6 +158,16 @@ fn concurrent_map_writes_show_current_lost_update_bug() {
     let b = doc(2);
     let a_map = a.get_map("state").get_mergeable_map("profile").unwrap();
     let b_map = b.get_map("state").get_mergeable_map("profile").unwrap();
+
+    assert_eq!(
+        a_map.id(),
+        b_map.id(),
+        "both peers should produce the same deterministic cid"
+    );
+    assert!(
+        a_map.id().is_mergeable(),
+        "map cid should be in the mergeable namespace"
+    );
 
     a_map.insert("name", "Ada").unwrap();
     b_map.insert("title", "Engineer").unwrap();

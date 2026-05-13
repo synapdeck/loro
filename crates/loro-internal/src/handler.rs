@@ -4195,29 +4195,66 @@ impl MapHandler {
         self.insert_container(key, child)
     }
 
+    /// Shared implementation for all `get_mergeable_*` methods.
+    ///
+    /// For detached handlers (no doc state yet), falls back to
+    /// [`Self::get_or_create_container`].
+    ///
+    /// For attached handlers, computes a deterministic [`ContainerID::Root`] in
+    /// the mergeable namespace from `(parent.id, key, child.kind())` and
+    /// constructs the handler from it. Two peers calling this with the same
+    /// `(parent, key, kind)` receive handlers with identical container ids,
+    /// which is what makes the child container mergeable on concurrent
+    /// first-write.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoroError::ArgErr`] if `C::from_handler` rejects the handler
+    /// built from the deterministic cid. By construction this is unreachable
+    /// because the cid carries `child.kind()`; the check guards against
+    /// future drift between `from_handler` and `kind`.
+    fn get_mergeable_container<C: HandlerTrait>(&self, key: &str, child: C) -> LoroResult<C> {
+        match &self.inner {
+            MaybeDetached::Detached(_) => self.get_or_create_container(key, child),
+            MaybeDetached::Attached(parent) => {
+                let cid = ContainerID::new_mergeable(&parent.id, key, child.kind());
+                C::from_handler(create_handler(parent, cid.clone())).ok_or_else(|| {
+                    LoroError::ArgErr(
+                        format!(
+                            "Expected value type {} but found {}",
+                            child.kind(),
+                            cid.container_type()
+                        )
+                        .into_boxed_str(),
+                    )
+                })
+            }
+        }
+    }
+
     #[cfg(feature = "counter")]
     pub fn get_mergeable_counter(&self, key: &str) -> LoroResult<counter::CounterHandler> {
-        self.get_or_create_container(key, counter::CounterHandler::new_detached())
+        self.get_mergeable_container(key, counter::CounterHandler::new_detached())
     }
 
     pub fn get_mergeable_map(&self, key: &str) -> LoroResult<MapHandler> {
-        self.get_or_create_container(key, MapHandler::new_detached())
+        self.get_mergeable_container(key, MapHandler::new_detached())
     }
 
     pub fn get_mergeable_list(&self, key: &str) -> LoroResult<ListHandler> {
-        self.get_or_create_container(key, ListHandler::new_detached())
+        self.get_mergeable_container(key, ListHandler::new_detached())
     }
 
     pub fn get_mergeable_movable_list(&self, key: &str) -> LoroResult<MovableListHandler> {
-        self.get_or_create_container(key, MovableListHandler::new_detached())
+        self.get_mergeable_container(key, MovableListHandler::new_detached())
     }
 
     pub fn get_mergeable_text(&self, key: &str) -> LoroResult<TextHandler> {
-        self.get_or_create_container(key, TextHandler::new_detached())
+        self.get_mergeable_container(key, TextHandler::new_detached())
     }
 
     pub fn get_mergeable_tree(&self, key: &str) -> LoroResult<TreeHandler> {
-        self.get_or_create_container(key, TreeHandler::new_detached())
+        self.get_mergeable_container(key, TreeHandler::new_detached())
     }
 
     pub fn contains_key(&self, key: &str) -> bool {
