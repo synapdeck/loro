@@ -1043,3 +1043,54 @@ fn lww_resolves_different_type_collision_at_import() {
     let b_map_again = b.get_map("state").get_mergeable_map("k").unwrap();
     assert_eq!(b_map_again.id(), b_map.id());
 }
+
+/// Three peers each independently register a mergeable child under the
+/// same key with three different kinds. After a full round-robin sync,
+/// every peer agrees on the same winner via LWW.
+#[test]
+#[cfg(feature = "counter")]
+fn lww_three_peer_type_conflict_converges() {
+    let a = doc(1);
+    let b = doc(2);
+    let c = doc(3);
+
+    // Each peer registers a different kind under "k" and mutates it once.
+    let a_text = a.get_map("state").get_mergeable_text("k").unwrap();
+    a_text.insert(0, "from_a", PosType::Unicode).unwrap();
+    a.commit_then_renew();
+
+    let b_map = b.get_map("state").get_mergeable_map("k").unwrap();
+    b_map.insert("from_b", true).unwrap();
+    b.commit_then_renew();
+
+    let c_list = c.get_map("state").get_mergeable_list("k").unwrap();
+    c_list.insert(0, "from_c").unwrap();
+    c.commit_then_renew();
+
+    // Full round-robin sync: every pair exchanges updates.
+    sync(&a, &b);
+    sync(&b, &c);
+    sync(&a, &c);
+    sync(&a, &b);
+
+    let va = a.get_deep_value().to_json_value();
+    let vb = b.get_deep_value().to_json_value();
+    let vc = c.get_deep_value().to_json_value();
+
+    assert_eq!(va, vb, "A and B must agree");
+    assert_eq!(vb, vc, "B and C must agree");
+
+    // Exactly one of the three kinds must be the visible content under "k".
+    // Text -> JSON string. Map -> JSON object. List -> JSON array.
+    let k = &va["state"]["k"];
+    let survivors = [
+        k.is_string(), // Text
+        k.is_object(), // Map
+        k.is_array(),  // List
+    ];
+    let count: usize = survivors.iter().filter(|x| **x).count();
+    assert_eq!(
+        count, 1,
+        "exactly one kind must survive; got {survivors:?} for value {k:?}"
+    );
+}
