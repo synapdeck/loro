@@ -1272,20 +1272,12 @@ impl DocState {
                 )
             }
             LoroValue::Map(mut map) => {
-                // Collect mergeable children registered on this map's side
-                // table so they nest under their logical parent key — see
-                // the parallel handling in `get_container_deep_value`.
-                let mergeable_children: Vec<(InternalString, ContainerID)> = self
-                    .store
-                    .get_container_mut(container)
-                    .and_then(|state| state.as_map_state())
-                    .map(|map_state| {
-                        map_state
-                            .iter_mergeable_children()
-                            .map(|(key, id)| (key.clone(), id.clone()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                // Mergeable children are not in `self.map` (no `MapSet` op
+                // encodes them), so they don't appear in the value returned
+                // by `MapState::get_value`. Collect them from the MapState
+                // side table so the deep-value walk nests them under their
+                // logical parent key alongside any regular entries.
+                let mergeable_children = self.collect_mergeable_children_of(container);
 
                 let map_mut = map.make_mut();
                 for (_key, value) in map_mut.iter_mut() {
@@ -1359,17 +1351,7 @@ impl DocState {
                 // by `MapState::get_value`. Collect them from the MapState
                 // side table so the deep-value walk nests them under their
                 // logical parent key alongside any regular entries.
-                let mergeable_children: Vec<(InternalString, ContainerID)> = self
-                    .store
-                    .get_container_mut(container)
-                    .and_then(|state| state.as_map_state())
-                    .map(|map_state| {
-                        map_state
-                            .iter_mergeable_children()
-                            .map(|(key, id)| (key.clone(), id.clone()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let mergeable_children = self.collect_mergeable_children_of(container);
 
                 if mergeable_children.is_empty() && map.iter().all(|x| !x.1.is_container()) {
                     return LoroValue::Map(map);
@@ -1485,6 +1467,29 @@ impl DocState {
             }
             _ => {}
         }
+    }
+
+    /// Collect (key, cid) pairs for mergeable children registered on the
+    /// parent MapState's side table for the given container index.
+    ///
+    /// Returns an empty Vec if the container is not a Map or has no
+    /// mergeable children. Used by both `get_container_deep_value` and
+    /// `get_container_deep_value_with_id` to nest mergeable child values
+    /// under their logical parent key during the deep-value walk.
+    fn collect_mergeable_children_of(
+        &mut self,
+        container: ContainerIdx,
+    ) -> Vec<(InternalString, ContainerID)> {
+        self.store
+            .get_container_mut(container)
+            .and_then(|state| state.as_map_state())
+            .map(|map_state| {
+                map_state
+                    .iter_mergeable_children()
+                    .map(|(key, id)| (key.clone(), id.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     // Because we need to calculate path based on [DocState], so we cannot extract
