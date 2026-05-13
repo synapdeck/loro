@@ -171,6 +171,20 @@ fn get_path_returns_logical_parent_path_for_mergeable_child() {
     );
 }
 
+#[test]
+#[cfg(feature = "counter")]
+fn deep_value_nests_mergeable_child_under_parent_and_hides_synthetic_root() {
+    let doc = doc(1);
+    let root = doc.get_map("state");
+    let counter = root.get_mergeable_counter("revision").unwrap();
+    counter.increment(2.0).unwrap();
+
+    assert_eq!(
+        doc.get_deep_value().to_json_value(),
+        json!({ "state": { "revision": 2.0 } })
+    );
+}
+
 /// Two peers each obtain the "profile" Map via `get_mergeable_map` and write
 /// to *different* keys. With non-mergeable child Maps, each peer creates a
 /// distinct peer-specific cid, so LWW drops one peer's Map entirely even

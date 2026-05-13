@@ -1041,6 +1041,17 @@ impl DocState {
             let Some(name) = self.root_container_name(idx) else {
                 continue;
             };
+            // Mergeable Roots live in a private cid namespace and are
+            // logically parented to a regular Map. They must not appear in
+            // the doc's top-level root enumeration — they are nested under
+            // their parent in deep value / events / paths.
+            if self
+                .arena
+                .idx_to_id(idx)
+                .is_some_and(|id| id.is_mergeable())
+            {
+                continue;
+            }
             let is_empty = self.root_container_is_empty(idx);
             match selected.entry(name.clone()) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
@@ -1168,6 +1179,21 @@ impl DocState {
                 )
             }
             LoroValue::Map(mut map) => {
+                // Collect mergeable children registered on this map's side
+                // table so they nest under their logical parent key — see
+                // the parallel handling in `get_container_deep_value`.
+                let mergeable_children: Vec<(InternalString, ContainerID)> = self
+                    .store
+                    .get_container_mut(container)
+                    .and_then(|state| state.as_map_state())
+                    .map(|map_state| {
+                        map_state
+                            .iter_mergeable_children()
+                            .map(|(key, id)| (key.clone(), id.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
                 let map_mut = map.make_mut();
                 for (_key, value) in map_mut.iter_mut() {
                     if value.is_container() {
@@ -1179,6 +1205,11 @@ impl DocState {
                         );
                         *value = new_value;
                     }
+                }
+                for (key, cid) in mergeable_children {
+                    let child_idx = self.arena.register_container(&cid);
+                    let new_value = self.get_container_deep_value_with_id(child_idx, Some(cid));
+                    map_mut.insert(key.to_string(), new_value);
                 }
 
                 LoroValue::Map(
@@ -1230,7 +1261,24 @@ impl DocState {
                 LoroValue::List(list)
             }
             LoroValue::Map(mut map) => {
-                if map.iter().all(|x| !x.1.is_container()) {
+                // Mergeable children are not in `self.map` (no `MapSet` op
+                // encodes them), so they don't appear in the value returned
+                // by `MapState::get_value`. Collect them from the MapState
+                // side table so the deep-value walk nests them under their
+                // logical parent key alongside any regular entries.
+                let mergeable_children: Vec<(InternalString, ContainerID)> = self
+                    .store
+                    .get_container_mut(container)
+                    .and_then(|state| state.as_map_state())
+                    .map(|map_state| {
+                        map_state
+                            .iter_mergeable_children()
+                            .map(|(key, id)| (key.clone(), id.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                if mergeable_children.is_empty() && map.iter().all(|x| !x.1.is_container()) {
                     return LoroValue::Map(map);
                 }
 
@@ -1242,6 +1290,11 @@ impl DocState {
                         let new_value = self.get_container_deep_value(container_idx);
                         *value = new_value;
                     }
+                }
+                for (key, cid) in mergeable_children {
+                    let child_idx = self.arena.register_container(&cid);
+                    let new_value = self.get_container_deep_value(child_idx);
+                    map_mut.insert(key.to_string(), new_value);
                 }
                 LoroValue::Map(map)
             }
@@ -1434,16 +1487,9 @@ impl DocState {
         let mut idx = idx;
         loop {
             let id = self.arena.idx_to_id(idx).unwrap();
-            // Mergeable Roots encode their (parent, key) in the cid itself, so the path entry
-            // can be derived directly without consulting the parent MapState's child registry.
-            if let Some((parent_id, key, _kind)) =
-                id.is_mergeable().then(|| id.parse_mergeable()).flatten()
-            {
-                let parent_idx = self.arena.register_container(&parent_id);
-                ans.push((id, Index::Key(key.into())));
-                idx = parent_idx;
-                continue;
-            }
+            // Mergeable Roots are parented in the arena and their cid is registered in the parent
+            // MapState's child side table, so the normal `get_child_index` lookup below resolves
+            // the logical path entry without needing to decode `(parent, key)` from the cid here.
             if let Some(parent_idx) = self.arena.get_parent(idx) {
                 let parent_state = self.store.get_container_mut(parent_idx)?;
                 let Some(prop) = parent_state.get_child_index(&id) else {

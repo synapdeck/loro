@@ -146,6 +146,15 @@ impl ContainerState for MapState {
                 ans.push(x.clone());
             }
         }
+        // Include mergeable children registered through the side table — they
+        // are not in `self.map` (no `MapSet` op encodes them) but they are
+        // logical children of this map for reachability / parent-edge
+        // wiring.
+        for (id, _) in self.child_containers.iter() {
+            if id.is_mergeable() {
+                ans.push(id.clone());
+            }
+        }
         ans
     }
 
@@ -240,6 +249,43 @@ impl MapState {
 
     pub fn get_last_edit_peer(&self, key: &str) -> Option<PeerID> {
         self.map.get(&key.into()).map(|v| v.peer)
+    }
+
+    /// Register a mergeable child container under `key` without emitting a
+    /// `MapSet(key, Container(cid))` op on the parent.
+    ///
+    /// Mergeable children have deterministic [`ContainerID::Root`] ids derived
+    /// from `(parent_id, key, kind)` (see [`ContainerID::new_mergeable`]).
+    /// Recording them through the normal `MapSet` op stream would put
+    /// `LoroValue::Container(cid)` into the parent's value slot for `key`,
+    /// which would resurrect the LWW lost-update bug we are trying to avoid:
+    /// concurrent first-touches by different peers would each write a
+    /// `MapSet`, one would win, and the other peer's container would be
+    /// orphaned.
+    ///
+    /// Instead, this side-table registration only populates `child_containers`
+    /// so the mergeable cid is reachable for parent-edge walks (deep value,
+    /// path resolution, reachability, deletion checks, child enumeration)
+    /// while leaving `self.map` — and therefore the encoded op stream and the
+    /// fast snapshot value — untouched.
+    pub(crate) fn register_mergeable_child(&mut self, key: InternalString, id: ContainerID) {
+        debug_assert!(
+            id.is_mergeable(),
+            "register_mergeable_child must only be called with mergeable container ids"
+        );
+        self.child_containers.insert(id, key);
+    }
+
+    /// Iterate `(key, cid)` pairs for mergeable children registered on this
+    /// map via [`Self::register_mergeable_child`]. Used by the deep-value walk
+    /// to nest mergeable child containers under their logical parent key.
+    pub(crate) fn iter_mergeable_children(
+        &self,
+    ) -> impl Iterator<Item = (&InternalString, &ContainerID)> {
+        self.child_containers
+            .iter()
+            .filter(|(id, _)| id.is_mergeable())
+            .map(|(id, key)| (key, id))
     }
 }
 

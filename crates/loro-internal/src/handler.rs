@@ -4218,6 +4218,18 @@ impl MapHandler {
             MaybeDetached::Detached(_) => self.get_or_create_container(key, child),
             MaybeDetached::Attached(parent) => {
                 let cid = ContainerID::new_mergeable(&parent.id, key, child.kind());
+                // Register the mergeable cid in the parent MapState's child side table so it
+                // shows up for deep-value, path resolution, reachability, deletion, and child-
+                // enumeration walks. We deliberately do NOT encode a `MapSet(key, Container(cid))`
+                // op here — see `MapState::register_mergeable_child` for the reasoning.
+                // `create_handler` below also registers the cid in the arena with the parent edge
+                // wired up, so the arena and MapState views agree afterwards.
+                parent.with_state(|state| {
+                    state
+                        .as_map_state_mut()
+                        .expect("mergeable children can only be attached to map containers")
+                        .register_mergeable_child(key.into(), cid.clone());
+                });
                 C::from_handler(create_handler(parent, cid.clone())).ok_or_else(|| {
                     LoroError::ArgErr(
                         format!(
