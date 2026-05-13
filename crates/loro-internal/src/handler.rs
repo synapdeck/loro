@@ -4200,6 +4200,26 @@ impl MapHandler {
         self.get_or_create_container(key, counter::CounterHandler::new_detached())
     }
 
+    pub fn get_mergeable_map(&self, key: &str) -> LoroResult<MapHandler> {
+        self.get_or_create_container(key, MapHandler::new_detached())
+    }
+
+    pub fn get_mergeable_list(&self, key: &str) -> LoroResult<ListHandler> {
+        self.get_or_create_container(key, ListHandler::new_detached())
+    }
+
+    pub fn get_mergeable_movable_list(&self, key: &str) -> LoroResult<MovableListHandler> {
+        self.get_or_create_container(key, MovableListHandler::new_detached())
+    }
+
+    pub fn get_mergeable_text(&self, key: &str) -> LoroResult<TextHandler> {
+        self.get_or_create_container(key, TextHandler::new_detached())
+    }
+
+    pub fn get_mergeable_tree(&self, key: &str) -> LoroResult<TreeHandler> {
+        self.get_or_create_container(key, TreeHandler::new_detached())
+    }
+
     pub fn contains_key(&self, key: &str) -> bool {
         self.get(key).is_some()
     }
