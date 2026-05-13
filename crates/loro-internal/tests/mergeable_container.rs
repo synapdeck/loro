@@ -716,3 +716,32 @@ fn type_mismatch_rejected_after_snapshot_registers_the_key() {
     let b_text = b.get_map("state").get_mergeable_text("k").unwrap();
     assert_eq!(b_text.id(), a_text.id());
 }
+
+/// A subscription on the mergeable child's cid must receive events when the
+/// child is mutated, symmetric to the existing parent-map subscription test.
+#[test]
+#[cfg(feature = "counter")]
+fn mergeable_child_subscription_receives_own_events() {
+    let doc = doc(1);
+    let counter = doc.get_map("state").get_mergeable_counter("revision").unwrap();
+
+    let count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+    let count_clone = count.clone();
+    let _sub = doc.subscribe(
+        &counter.id(),
+        Arc::new(move |_event| {
+            *count_clone.lock().unwrap() += 1;
+        }),
+    );
+
+    counter.increment(1.0).unwrap();
+    doc.commit_then_renew();
+    counter.increment(2.0).unwrap();
+    doc.commit_then_renew();
+
+    let observed = *count.lock().unwrap();
+    assert!(
+        observed >= 2,
+        "mergeable-child subscription must fire at least once per commit; got {observed} events"
+    );
+}
