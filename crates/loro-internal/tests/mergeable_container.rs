@@ -745,3 +745,21 @@ fn mergeable_child_subscription_receives_own_events() {
         "mergeable-child subscription must fire at least once per commit; got {observed} events"
     );
 }
+
+/// A detached map handler (built without a parent doc) supports
+/// `get_mergeable_*` by falling back to `get_or_create_container`. The
+/// fallback path doesn't compute deterministic cids — that's intentional;
+/// determinism is meaningless until the handler attaches to a doc — but it
+/// must still return a working child handler that callers can mutate.
+#[test]
+#[cfg(feature = "counter")]
+fn detached_map_get_mergeable_counter_falls_back_cleanly() {
+    use loro_internal::MapHandler;
+    let detached = MapHandler::new_detached();
+    let counter = detached
+        .get_mergeable_counter("revision")
+        .expect("detached fallback must succeed");
+    counter.increment(7.0).expect("detached counter must be mutable");
+    // The detached handler still surfaces the value through its local state.
+    assert_eq!(counter.get_value().to_json_value(), json!(7.0));
+}
