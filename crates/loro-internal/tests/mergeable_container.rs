@@ -688,3 +688,31 @@ fn mergeable_cid_roundtrips_for_every_container_kind() {
         assert_eq!(decoded_kind, kind, "kind {kind:?}: kind roundtrip");
     }
 }
+
+/// After snapshot import registers `("k", Text)` on the receiver via the
+/// recovery walk, a local `get_mergeable_map("k")` on the receiver must fail
+/// with type-mismatch — exactly as it would if the text was registered
+/// locally first.
+#[test]
+fn type_mismatch_rejected_after_snapshot_registers_the_key() {
+    let a = doc(1);
+    let a_text = a.get_map("state").get_mergeable_text("k").unwrap();
+    a_text.insert(0, "x", PosType::Unicode).unwrap();
+    a.commit_then_renew();
+    let snapshot = a.export(ExportMode::Snapshot).unwrap();
+
+    let b = doc(2);
+    b.import(&snapshot).unwrap();
+
+    // Mergeable child for "k" is now registered on B as Text via the
+    // recovery walk. Asking for a Map under "k" must error.
+    let err = b.get_map("state").get_mergeable_map("k").unwrap_err();
+    assert!(
+        format!("{err:?}").contains("Expected value type"),
+        "expected ArgErr after snapshot-registered mergeable child blocks a different kind; got {err:?}"
+    );
+
+    // Asking for Text under "k" still works and resolves the same cid.
+    let b_text = b.get_map("state").get_mergeable_text("k").unwrap();
+    assert_eq!(b_text.id(), a_text.id());
+}
