@@ -787,7 +787,7 @@ impl DocState {
     pub fn does_container_exist(&mut self, id: &ContainerID) -> bool {
         // A container may exist even if not yet registered in the arena.
         // Check arena first, then fall back to KV presence in the store.
-        if id.is_root() {
+        if id.is_root() && !id.is_mergeable() {
             return true;
         }
 
@@ -1394,7 +1394,7 @@ impl DocState {
     }
 
     pub(crate) fn get_reachable(&mut self, id: &ContainerID) -> bool {
-        if matches!(id, ContainerID::Root { .. }) {
+        if id.is_root() && !id.is_mergeable() {
             return true;
         }
 
@@ -1419,7 +1419,7 @@ impl DocState {
                 }
                 idx = parent_idx;
             } else {
-                if id.is_root() {
+                if id.is_root() && !id.is_mergeable() {
                     return true;
                 }
 
@@ -1434,6 +1434,16 @@ impl DocState {
         let mut idx = idx;
         loop {
             let id = self.arena.idx_to_id(idx).unwrap();
+            // Mergeable Roots encode their (parent, key) in the cid itself, so the path entry
+            // can be derived directly without consulting the parent MapState's child registry.
+            if let Some((parent_id, key, _kind)) =
+                id.is_mergeable().then(|| id.parse_mergeable()).flatten()
+            {
+                let parent_idx = self.arena.register_container(&parent_id);
+                ans.push((id, Index::Key(key.into())));
+                idx = parent_idx;
+                continue;
+            }
             if let Some(parent_idx) = self.arena.get_parent(idx) {
                 let parent_state = self.store.get_container_mut(parent_idx)?;
                 let Some(prop) = parent_state.get_child_index(&id) else {

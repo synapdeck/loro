@@ -42,7 +42,9 @@ impl DocState {
                 idx = parent_idx;
                 visited.push(idx);
             } else {
-                break !id.is_root();
+                // Top-level (non-mergeable) Roots are always alive; everything else that walked
+                // all the way up without finding a parent is treated as deleted.
+                break !id.is_root() || id.is_mergeable();
             }
         };
 

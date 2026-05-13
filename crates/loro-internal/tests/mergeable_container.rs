@@ -1,6 +1,6 @@
 use loro_internal::{
-    cursor::PosType, handler::ValueOrHandler, loro::ExportMode, ContainerType, HandlerTrait,
-    LoroDoc, ToJson,
+    cursor::PosType, event::Index, handler::ValueOrHandler, loro::ExportMode, ContainerType,
+    HandlerTrait, LoroDoc, ToJson,
 };
 use serde_json::json;
 
@@ -145,6 +145,30 @@ fn user_root_names_cannot_use_mergeable_namespace() {
     assert!(!loro_common::check_root_container_name(
         loro_common::MERGEABLE_NAMESPACE_PREFIX
     ));
+}
+
+#[test]
+#[cfg(feature = "counter")]
+fn get_path_returns_logical_parent_path_for_mergeable_child() {
+    let doc = doc(1);
+    let root = doc.get_map("state");
+    let counter = root.get_mergeable_counter("revision").unwrap();
+    // Exercise the cid path directly; child-side wiring needed to keep
+    // mutating ops alive arrives in a later commit.
+    let _ = counter.increment(1.0);
+
+    let path = doc
+        .get_path_to_container(&counter.id())
+        .expect("mergeable counter should have a logical path");
+    let indexes = path
+        .iter()
+        .map(|(_, index)| index.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        indexes,
+        vec![Index::Key("state".into()), Index::Key("revision".into()),],
+        "mergeable child path should walk logical parent edges, not the synthetic Root name",
+    );
 }
 
 /// Two peers each obtain the "profile" Map via `get_mergeable_map` and write
