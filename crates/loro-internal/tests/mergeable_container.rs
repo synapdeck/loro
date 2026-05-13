@@ -582,3 +582,37 @@ fn parse_mergeable_rejects_malformed_payloads() {
     assert!(mismatched.parse_mergeable().is_none(),
         "type-byte mismatch with Root.container_type must reject");
 }
+
+/// `LoroDoc::get_map` must reject names in the mergeable namespace at the
+/// call site, not just in `check_root_container_name`. Otherwise user code
+/// could fabricate a Root cid that masquerades as a mergeable child and
+/// confuse the parent-edge walks.
+///
+/// This test runs `check_root_container_name` directly on a variety of
+/// user-supplied strings; the runtime `get_map` / `get_text` / etc. calls
+/// route through this validator (see callers in `crates/loro-internal/src/`).
+/// If the validator is bypassed by a runtime path, that's a separate bug —
+/// but it's not something this test can prove without intentionally writing
+/// `🤝:` keys, which is what we're trying to prevent in the first place.
+#[test]
+fn root_name_validator_rejects_mergeable_namespace_inputs() {
+    use loro_common::{check_root_container_name, MERGEABLE_NAMESPACE_PREFIX};
+
+    // Bare prefix.
+    assert!(!check_root_container_name(MERGEABLE_NAMESPACE_PREFIX));
+    // Prefix + arbitrary payload.
+    assert!(!check_root_container_name("🤝:deadbeef"));
+    assert!(!check_root_container_name("🤝:"));
+    // Prefix-as-substring is OK (not a prefix), validator still allows it.
+    assert!(check_root_container_name("foo🤝:bar"));
+    // Prefix with a leading zero-width space is NOT a prefix match, allowed.
+    assert!(check_root_container_name("\u{200B}🤝:abc"));
+    // Sanity: ordinary user names still pass.
+    assert!(check_root_container_name("state"));
+    assert!(check_root_container_name("ordinary-name_with-symbols"));
+    // Empty is still rejected (pre-existing behavior).
+    assert!(!check_root_container_name(""));
+    // Slash and NUL still rejected (pre-existing behavior).
+    assert!(!check_root_container_name("a/b"));
+    assert!(!check_root_container_name("a\0b"));
+}
