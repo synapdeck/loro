@@ -795,3 +795,26 @@ fn mergeable_cid_roundtrips_for_degenerate_keys() {
         assert_eq!(decoded_kind, ContainerType::Map);
     }
 }
+
+/// Shallow snapshot export should preserve mergeable child state and parent
+/// edges on the receiver, the same as a full snapshot.
+#[test]
+#[cfg(feature = "counter")]
+fn shallow_snapshot_roundtrip_preserves_mergeable_child() {
+    let a = doc(1);
+    let counter = a.get_map("state").get_mergeable_counter("revision").unwrap();
+    counter.increment(4.0).unwrap();
+    a.commit_then_renew();
+
+    // ShallowSnapshot at current frontiers.
+    let frontiers = a.state_frontiers();
+    let snapshot = a.export(ExportMode::ShallowSnapshot(std::borrow::Cow::Owned(frontiers))).unwrap();
+
+    let b = doc(2);
+    b.import(&snapshot).unwrap();
+    assert_eq!(
+        b.get_deep_value().to_json_value(),
+        json!({ "state": { "revision": 4.0 } }),
+        "shallow snapshot must carry mergeable child state and side-table reconstruction"
+    );
+}

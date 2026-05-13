@@ -1453,6 +1453,35 @@ impl DocState {
                         ans.push(id.clone());
                     }
                 }
+                // Mergeable children live in the parent MapState's `child_containers` side table,
+                // not in the value entries above. Pull them in too so alive-container walks
+                // (notably shallow snapshot export) include mergeable cids and don't filter their
+                // KV out by `retain_keys`.
+                //
+                // Only include mergeable children that already have state in the store (i.e. at
+                // least one op was applied). Unmutated children are registered in the side table
+                // by `get_mergeable_*` calls but have no KV entry; including them would cause
+                // `ensure_container` to write an empty container into the snapshot, making it
+                // appear in the deep value of the receiving peer — which would contradict the
+                // contract that an unmutated mergeable child does not round-trip through a
+                // snapshot.
+                let mergeable_cids: Vec<ContainerID> = self
+                    .store
+                    .get_container_mut(idx)
+                    .and_then(|state| state.as_map_state())
+                    .map(|map_state| {
+                        map_state
+                            .iter_mergeable_children()
+                            .map(|(_key, cid)| cid.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for cid in mergeable_cids {
+                    let child_idx = self.arena.register_container(&cid);
+                    if self.store.get_value(child_idx).is_some() {
+                        ans.push(cid);
+                    }
+                }
             }
             _ => {}
         }
