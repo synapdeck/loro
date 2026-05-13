@@ -2165,6 +2165,14 @@ impl LoroMap {
         ))
     }
 
+    /// Get or create a mergeable Counter at this map key.
+    #[cfg(feature = "counter")]
+    pub fn get_mergeable_counter(&self, key: &str) -> LoroResult<LoroCounter> {
+        Ok(LoroCounter::from_handler(
+            self.handler.get_mergeable_counter(key)?,
+        ))
+    }
+
     /// Delete all key-value pairs in the map.
     pub fn clear(&self) -> LoroResult<()> {
         self.handler.clear()

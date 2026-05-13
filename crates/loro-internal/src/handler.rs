@@ -4195,6 +4195,11 @@ impl MapHandler {
         self.insert_container(key, child)
     }
 
+    #[cfg(feature = "counter")]
+    pub fn get_mergeable_counter(&self, key: &str) -> LoroResult<counter::CounterHandler> {
+        self.get_or_create_container(key, counter::CounterHandler::new_detached())
+    }
+
     pub fn contains_key(&self, key: &str) -> bool {
         self.get(key).is_some()
     }
