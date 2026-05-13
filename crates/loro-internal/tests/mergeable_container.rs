@@ -461,3 +461,71 @@ fn empty_mergeable_child_after_snapshot_import() {
     assert_eq!(b_counter.id(), _counter.id(), "cid still deterministic");
     assert_eq!(b_counter.get_value().to_json_value(), json!(0.0));
 }
+
+/// Snapshot import where both peers registered the same `(key, kind)`:
+/// deterministic cids match, recovery walk converges, content from peer A
+/// wins through normal CRDT merge.
+#[test]
+fn snapshot_import_same_type_collision_converges() {
+    let a = doc(1);
+    let a_text = a.get_map("state").get_mergeable_text("notes").unwrap();
+    a_text.insert(0, "A", PosType::Unicode).unwrap();
+    a.commit_then_renew();
+    let snapshot = a.export(ExportMode::Snapshot).unwrap();
+
+    let b = doc(2);
+    let b_text = b.get_map("state").get_mergeable_text("notes").unwrap();
+    b_text.insert(0, "B", PosType::Unicode).unwrap();
+    b.commit_then_renew();
+    assert_eq!(a_text.id(), b_text.id(), "cids must match before import");
+
+    b.import(&snapshot).unwrap();
+
+    // Sync back so A sees both.
+    sync(&a, &b);
+    let value = a.get_deep_value().to_json_value();
+    assert!(
+        value == json!({ "state": { "notes": "AB" } })
+            || value == json!({ "state": { "notes": "BA" } }),
+        "both edits must survive on same-type collision; got {value}"
+    );
+    assert_eq!(b.get_deep_value().to_json_value(), value);
+}
+
+/// Snapshot import where the LOCAL peer has registered a different kind for
+/// the same key than the SNAPSHOT peer. The deterministic cids differ (kind
+/// is part of the cid hash), so the recovery walk produces two distinct
+/// mergeable child cids under the same key in the parent's side table.
+///
+/// Both cids coexist; the parent's deep value surfaces only one (the side-
+/// table iterator order). User code that mixes types under the same key has
+/// bigger problems — this test documents the observable behavior so that any
+/// future tightening (e.g. promoting it to an error) is a deliberate change.
+#[test]
+fn snapshot_import_different_type_collision_is_observable() {
+    let a = doc(1);
+    let a_text = a.get_map("state").get_mergeable_text("k").unwrap();
+    a_text.insert(0, "hello", PosType::Unicode).unwrap();
+    a.commit_then_renew();
+    let snapshot = a.export(ExportMode::Snapshot).unwrap();
+
+    let b = doc(2);
+    let b_map = b.get_map("state").get_mergeable_map("k").unwrap();
+    b_map.insert("flag", true).unwrap();
+    b.commit_then_renew();
+    assert_ne!(a_text.id(), b_map.id(),
+        "different kinds under the same key MUST produce different cids");
+
+    let result = b.import(&snapshot);
+    assert!(result.is_ok(), "import itself must not fail; got {result:?}");
+
+    // Both mergeable cids exist in the store. Re-invoking get_mergeable_*
+    // for either kind now fails with type-mismatch ArgErr, because the
+    // pre-existing side-table entry blocks the other kind.
+    let err = b.get_map("state").get_mergeable_text("k").err();
+    let err2 = b.get_map("state").get_mergeable_map("k").err();
+    assert!(
+        err.is_some() || err2.is_some(),
+        "at least one kind must now be locked out: text_err={err:?}, map_err={err2:?}"
+    );
+}
