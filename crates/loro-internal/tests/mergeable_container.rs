@@ -616,3 +616,43 @@ fn root_name_validator_rejects_mergeable_namespace_inputs() {
     assert!(!check_root_container_name("a/b"));
     assert!(!check_root_container_name("a\0b"));
 }
+
+/// Two peers independently navigate `state → mergeable map "profile" →
+/// mergeable counter "revision"` and increment. The deterministic cid for
+/// "revision" is the same on both peers (it's a function of the "profile"
+/// cid, which is itself deterministic from "state"'s cid + "profile" + Map).
+/// After sync, both peers see the counter at 2.0 nested correctly.
+#[test]
+#[cfg(feature = "counter")]
+fn nested_mergeable_concurrent_counter_converges() {
+    let a = doc(1);
+    let b = doc(2);
+
+    let a_profile = a.get_map("state").get_mergeable_map("profile").unwrap();
+    let b_profile = b.get_map("state").get_mergeable_map("profile").unwrap();
+    assert_eq!(a_profile.id(), b_profile.id());
+
+    let a_rev = a_profile.get_mergeable_counter("revision").unwrap();
+    let b_rev = b_profile.get_mergeable_counter("revision").unwrap();
+    assert_eq!(a_rev.id(), b_rev.id());
+
+    a_rev.increment(1.0).unwrap();
+    b_rev.increment(1.0).unwrap();
+    sync(&a, &b);
+
+    let expected = json!({ "state": { "profile": { "revision": 2.0 } } });
+    assert_eq!(a.get_deep_value().to_json_value(), expected);
+    assert_eq!(b.get_deep_value().to_json_value(), expected);
+
+    // Path resolution still walks both mergeable hops.
+    let path = a.get_path_to_container(&a_rev.id()).expect("path");
+    let indexes = path.iter().map(|(_, idx)| idx.clone()).collect::<Vec<_>>();
+    assert_eq!(
+        indexes,
+        vec![
+            Index::Key("state".into()),
+            Index::Key("profile".into()),
+            Index::Key("revision".into()),
+        ]
+    );
+}
