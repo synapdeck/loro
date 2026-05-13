@@ -879,3 +879,40 @@ fn delete_on_mergeable_child_key_observed_behavior() {
     let counter2 = root.get_mergeable_counter("revision").unwrap();
     assert_eq!(counter2.id(), counter.id());
 }
+
+/// `LoroDoc::has_container(cid)` must return `false` for a mergeable cid
+/// that has never been written to, and `true` after the child has been
+/// mutated. Mergeable existence depends on state, not on the name shape, so
+/// the short-circuit for plain `Root` ids must skip mergeable namespace cids.
+#[test]
+#[cfg(feature = "counter")]
+fn has_container_reports_false_for_unwritten_mergeable_child() {
+    use loro_common::{ContainerID, ContainerType};
+
+    let doc = doc(1);
+    let root = doc.get_map("state");
+
+    // Build the deterministic mergeable cid by hand, WITHOUT calling
+    // get_mergeable_counter (which would register the side-table entry).
+    let parent_id = root.id();
+    let unwritten_cid =
+        ContainerID::new_mergeable(&parent_id, "revision", ContainerType::Counter);
+    assert!(unwritten_cid.is_mergeable());
+    assert!(
+        !doc.has_container(&unwritten_cid),
+        "has_container must report false for an unwritten mergeable cid"
+    );
+
+    // Now actually create and mutate the child. has_container must flip to true.
+    let counter = root.get_mergeable_counter("revision").unwrap();
+    counter.increment(1.0).unwrap();
+    assert_eq!(counter.id(), unwritten_cid, "cid is deterministic");
+    assert!(
+        doc.has_container(&unwritten_cid),
+        "has_container must report true after the mergeable child has state"
+    );
+
+    // Regular root containers still report true as before (regression guard).
+    let regular_root = ContainerID::new_root("state", ContainerType::Map);
+    assert!(doc.has_container(&regular_root));
+}
