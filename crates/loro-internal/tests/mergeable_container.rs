@@ -367,3 +367,36 @@ fn update_import_populates_mergeable_side_table_on_receiver() {
         vec![Index::Key("state".into()), Index::Key("revision".into())]
     );
 }
+
+/// Three peers each increment the same mergeable counter once. After a full
+/// round-robin sync, every peer must observe `3.0` and the same deterministic
+/// cid. Two-peer tests can't catch ordering or idempotency bugs that fire
+/// only when more than two histories overlap.
+#[test]
+#[cfg(feature = "counter")]
+fn three_peer_mergeable_counter_convergence() {
+    let a = doc(1);
+    let b = doc(2);
+    let c = doc(3);
+
+    let a_counter = a.get_map("state").get_mergeable_counter("revision").unwrap();
+    let b_counter = b.get_map("state").get_mergeable_counter("revision").unwrap();
+    let c_counter = c.get_map("state").get_mergeable_counter("revision").unwrap();
+    assert_eq!(a_counter.id(), b_counter.id());
+    assert_eq!(b_counter.id(), c_counter.id());
+
+    a_counter.increment(1.0).unwrap();
+    b_counter.increment(1.0).unwrap();
+    c_counter.increment(1.0).unwrap();
+
+    // Full round-robin: every pair syncs.
+    sync(&a, &b);
+    sync(&b, &c);
+    sync(&a, &c);
+    sync(&a, &b);
+
+    let expected = json!({ "state": { "revision": 3.0 } });
+    assert_eq!(a.get_deep_value().to_json_value(), expected);
+    assert_eq!(b.get_deep_value().to_json_value(), expected);
+    assert_eq!(c.get_deep_value().to_json_value(), expected);
+}
