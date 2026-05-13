@@ -1094,3 +1094,45 @@ fn lww_three_peer_type_conflict_converges() {
         "exactly one kind must survive; got {survivors:?} for value {k:?}"
     );
 }
+
+/// If both competing mergeable cids have no applied ops, LWW resolution
+/// is deferred — neither is registered. Once an op arrives on either
+/// side and another sync happens, the next resolution pass picks the
+/// winner (by virtue of having an op at all).
+#[test]
+#[cfg(feature = "counter")]
+fn lww_unmutated_competitors_defer_resolution() {
+    let a = doc(1);
+    let _a_text = a.get_map("state").get_mergeable_text("k").unwrap();
+    // Deliberately no mutation.
+    a.commit_then_renew();
+
+    let b = doc(2);
+    let _b_map = b.get_map("state").get_mergeable_map("k").unwrap();
+    b.commit_then_renew();
+
+    // B imports A's snapshot. Both cids have no ops; LWW resolution defers, and the empty-child
+    // invariant still holds: B's deep value shows "state": {}.
+    let snapshot = a.export(ExportMode::Snapshot).unwrap();
+    b.import(&snapshot).unwrap();
+    assert_eq!(
+        b.get_deep_value().to_json_value(),
+        json!({ "state": {} }),
+        "unmutated competitors must defer; deep value stays empty"
+    );
+
+    // Now A produces an op on its text. After re-sync, LWW kicks in:
+    // A's text has a first-op IdLp; B's map has none; A's text wins
+    // by virtue of having an op at all.
+    let a_text = a.get_map("state").get_mergeable_text("k").unwrap();
+    a_text.insert(0, "from_a", PosType::Unicode).unwrap();
+    a.commit_then_renew();
+    sync(&a, &b);
+
+    let value = b.get_deep_value().to_json_value();
+    assert_eq!(
+        value,
+        json!({ "state": { "k": "from_a" } }),
+        "after A's op, A's text wins; B's unmutated map loses; got {value}"
+    );
+}
