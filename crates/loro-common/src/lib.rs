@@ -68,9 +68,68 @@ pub struct CompactId {
     pub counter: NonMaxI32,
 }
 
+/// Namespace prefix used to encode mergeable container IDs into Root container names.
+///
+/// The 🤝 ("handshake") sentinel mirrors Loro's existing 🦜 brand convention
+/// (`crates/loro-common/src/value.rs::LORO_CONTAINER_ID_PREFIX`) and signals
+/// "two peers agreeing on the same cid." The trailing `:` separates the brand
+/// from the hex-encoded `(parent, key, container_type)` payload; hex characters
+/// (`0-9a-f`) cannot collide with the prefix bytes, so no closing sentinel is
+/// needed. User-created root container names are rejected by
+/// `check_root_container_name` if they start with this prefix.
+pub const MERGEABLE_NAMESPACE_PREFIX: &str = "🤝:";
+
+fn write_len_prefixed_segment(out: &mut Vec<u8>, bytes: &[u8]) {
+    leb128::write::unsigned(out, bytes.len() as u64).unwrap();
+    out.extend_from_slice(bytes);
+}
+
+fn read_len_prefixed_segment(input: &mut &[u8]) -> Option<Vec<u8>> {
+    let len = leb128::read::unsigned(input).ok()? as usize;
+    if input.len() < len {
+        return None;
+    }
+    let (segment, rest) = input.split_at(len);
+    *input = rest;
+    Some(segment.to_vec())
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    fn value(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(s.len() / 2);
+    for pair in s.as_bytes().chunks_exact(2) {
+        out.push((value(pair[0])? << 4) | value(pair[1])?);
+    }
+    Some(out)
+}
+
 /// Return whether the given name is a valid root container name.
 pub fn check_root_container_name(name: &str) -> bool {
-    !name.is_empty() && name.char_indices().all(|(_, x)| x != '/' && x != '\0')
+    !name.is_empty()
+        && !name.starts_with(MERGEABLE_NAMESPACE_PREFIX)
+        && name.char_indices().all(|(_, x)| x != '/' && x != '\0')
 }
 
 impl CompactId {
@@ -583,6 +642,58 @@ mod container {
 
         pub fn is_unknown(&self) -> bool {
             matches!(self.container_type(), ContainerType::Unknown(_))
+        }
+
+        /// Create a mergeable container ID for the given parent, key, and container type.
+        /// The ID is encoded as a Root container with a reserved namespace prefix so that
+        /// two peers calling this with the same arguments produce the identical `ContainerID`.
+        pub fn new_mergeable(
+            parent: &ContainerID,
+            key: &str,
+            container_type: ContainerType,
+        ) -> Self {
+            let mut encoded = Vec::new();
+            write_len_prefixed_segment(&mut encoded, &parent.to_bytes());
+            write_len_prefixed_segment(&mut encoded, key.as_bytes());
+            encoded.push(container_type.to_u8());
+
+            let name = format!("{}{}", MERGEABLE_NAMESPACE_PREFIX, hex_encode(&encoded));
+
+            Self::Root {
+                name: name.into(),
+                container_type,
+            }
+        }
+
+        /// Returns `true` if this is a mergeable container ID (i.e. created via `new_mergeable`).
+        pub fn is_mergeable(&self) -> bool {
+            matches!(self, Self::Root { name, .. } if name.starts_with(MERGEABLE_NAMESPACE_PREFIX))
+        }
+
+        /// Decode a mergeable container ID back into its `(parent, key, container_type)` components.
+        /// Returns `None` if this is not a valid mergeable container ID.
+        pub fn parse_mergeable(&self) -> Option<(ContainerID, String, ContainerType)> {
+            let Self::Root {
+                name,
+                container_type,
+            } = self
+            else {
+                return None;
+            };
+            let payload = name.strip_prefix(MERGEABLE_NAMESPACE_PREFIX)?;
+            let decoded = hex_decode(payload)?;
+            let mut input = decoded.as_slice();
+            let parent_bytes = read_len_prefixed_segment(&mut input)?;
+            let key_bytes = read_len_prefixed_segment(&mut input)?;
+            if input.len() != 1 {
+                return None;
+            }
+            let encoded_type = ContainerType::try_from_u8(input[0]).ok()?;
+            if encoded_type != *container_type {
+                return None;
+            }
+            let key = String::from_utf8(key_bytes).ok()?;
+            Some((ContainerID::from_bytes(&parent_bytes), key, encoded_type))
         }
     }
 

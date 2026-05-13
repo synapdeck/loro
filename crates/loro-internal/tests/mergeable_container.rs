@@ -1,4 +1,6 @@
-use loro_internal::{cursor::PosType, handler::ValueOrHandler, loro::ExportMode, LoroDoc, ToJson};
+use loro_internal::{
+    cursor::PosType, handler::ValueOrHandler, loro::ExportMode, ContainerType, LoroDoc, ToJson,
+};
 use serde_json::json;
 
 fn doc(peer: u64) -> LoroDoc {
@@ -91,6 +93,27 @@ fn concurrent_list_inserts_show_current_lost_update_bug() {
             || value == json!({ "state": { "items": ["B", "A"] } }),
         "both concurrent list inserts should survive on the merged list; got {value}",
     );
+}
+
+#[test]
+#[cfg(feature = "counter")]
+fn mergeable_container_id_roundtrips_parent_key_and_type() {
+    let parent = loro_common::ContainerID::new_root("state", ContainerType::Map);
+    let key = "field\u{1}with/slash:and:semicolon";
+    let cid = loro_common::ContainerID::new_mergeable(&parent, key, ContainerType::Counter);
+
+    assert!(cid.is_mergeable());
+    let (decoded_parent, decoded_key, decoded_type) = cid.parse_mergeable().unwrap();
+    assert_eq!(decoded_parent, parent);
+    assert_eq!(decoded_key, key);
+    assert_eq!(decoded_type, ContainerType::Counter);
+}
+
+#[test]
+fn user_root_names_cannot_use_mergeable_namespace() {
+    assert!(!loro_common::check_root_container_name(
+        loro_common::MERGEABLE_NAMESPACE_PREFIX
+    ));
 }
 
 /// Two peers each obtain the "profile" Map via `get_mergeable_map` and write
