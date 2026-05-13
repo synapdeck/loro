@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex};
+
 use loro_internal::{
     cursor::PosType, event::Index, handler::ValueOrHandler, loro::ExportMode, ContainerType,
     HandlerTrait, LoroDoc, ToJson,
@@ -214,5 +216,115 @@ fn concurrent_map_writes_show_current_lost_update_bug() {
     assert_eq!(
         a.get_deep_value().to_json_value(),
         json!({ "state": { "profile": { "name": "Ada", "title": "Engineer" } } })
+    );
+}
+
+/// Snapshot round-trip must preserve the parent edges (logical path) and
+/// state values for mergeable child containers nested inside other mergeable
+/// child containers.
+///
+/// Source peer creates `state` → mergeable map `profile` → mergeable counter
+/// `revision`, mutates each, then exports a snapshot. Importing into a fresh
+/// peer must reproduce the same deep value and the same logical path for
+/// the counter.
+#[test]
+#[cfg(feature = "counter")]
+fn snapshot_roundtrip_preserves_mergeable_parent_edges_and_values() {
+    let source = doc(1);
+    let root = source.get_map("state");
+    let nested = root.get_mergeable_map("profile").unwrap();
+    nested.insert("name", "Ada").unwrap();
+    let counter = nested.get_mergeable_counter("revision").unwrap();
+    counter.increment(3.0).unwrap();
+
+    let snapshot = source.export(ExportMode::Snapshot).unwrap();
+    let imported = doc(2);
+    imported.import(&snapshot).unwrap();
+
+    assert_eq!(
+        imported.get_deep_value().to_json_value(),
+        source.get_deep_value().to_json_value(),
+        "deep value of the imported doc must match the source after snapshot round-trip"
+    );
+
+    let imported_counter = imported
+        .get_map("state")
+        .get_mergeable_map("profile")
+        .unwrap()
+        .get_mergeable_counter("revision")
+        .unwrap();
+    let path = imported
+        .get_path_to_container(&imported_counter.id())
+        .expect("mergeable counter must have a logical path after snapshot import");
+    let indexes = path
+        .iter()
+        .map(|(_, index)| index.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        indexes,
+        vec![
+            Index::Key("state".into()),
+            Index::Key("profile".into()),
+            Index::Key("revision".into()),
+        ],
+        "imported counter should walk logical parent edges across two mergeable hops"
+    );
+}
+
+/// If a mergeable child is already registered under `key` with one container
+/// type, a subsequent request under the same key with a different container
+/// type must return [`LoroError::ArgErr`] rather than silently producing a
+/// second container with a divergent deterministic cid.
+#[test]
+fn mergeable_type_mismatch_returns_arg_error() {
+    let doc = doc(1);
+    let root = doc.get_map("state");
+    root.get_mergeable_text("field").unwrap();
+
+    let err = root.get_mergeable_map("field").unwrap_err();
+    assert!(
+        format!("{err:?}").contains("Expected value type"),
+        "expected ArgErr describing the type mismatch; got {err:?}"
+    );
+}
+
+/// Subscribing to the *parent* map must receive events when one of its
+/// mergeable children is mutated: subscriptions on ancestor containers should
+/// observe deltas from mergeable descendants, not only subscriptions on the
+/// mergeable child itself.
+#[test]
+#[cfg(feature = "counter")]
+fn parent_map_subscription_receives_mergeable_child_events() {
+    let doc = doc(1);
+    let root = doc.get_map("state");
+    let counter = root.get_mergeable_counter("revision").unwrap();
+
+    let received: Arc<Mutex<Vec<Vec<Index>>>> = Arc::new(Mutex::new(Vec::new()));
+    let received_clone = received.clone();
+    let _sub = doc.subscribe(
+        &root.id(),
+        Arc::new(move |event| {
+            let mut g = received_clone.lock().unwrap();
+            for container_diff in event.events.iter() {
+                g.push(
+                    container_diff
+                        .path
+                        .iter()
+                        .map(|(_, idx)| idx.clone())
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }),
+    );
+
+    counter.increment(1.0).unwrap();
+    doc.commit_then_renew();
+
+    let captured = received.lock().unwrap();
+    assert!(
+        captured.iter().any(|path| path
+            .iter()
+            .any(|idx| matches!(idx, Index::Key(k) if &**k == "revision"))),
+        "parent map subscriber should see an event whose path includes the mergeable child's key 'revision'; got {captured:?}",
     );
 }

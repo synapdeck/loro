@@ -287,6 +287,17 @@ impl MapState {
             .filter(|(id, _)| id.is_mergeable())
             .map(|(id, key)| (key, id))
     }
+
+    /// Return the cid of the mergeable child currently registered under `key`,
+    /// if any. Used by `get_mergeable_*` to detect type-mismatch requests on
+    /// the same key (e.g. `get_mergeable_text("k")` then
+    /// `get_mergeable_map("k")`) before they produce divergent containers.
+    pub(crate) fn get_mergeable_child_id(&self, key: &InternalString) -> Option<&ContainerID> {
+        self.child_containers
+            .iter()
+            .find(|(id, k)| id.is_mergeable() && *k == key)
+            .map(|(id, _)| id)
+    }
 }
 
 mod snapshot {

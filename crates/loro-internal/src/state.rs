@@ -828,6 +828,52 @@ impl DocState {
         ans
     }
 
+    /// Walk all known containers and, for each mergeable child container,
+    /// register it under its parent MapState's `child_containers` side table.
+    ///
+    /// Mergeable children are stored in KV like any other container (they have
+    /// their own state), so they survive snapshot round-trip at the container
+    /// level. But the parent MapState side table that the deep-value walk and
+    /// path resolution consult is intentionally not serialized: encoding it
+    /// would require extending the on-wire format (forbidden by the plan), and
+    /// the data is fully recoverable from the deterministic cid alone via
+    /// [`ContainerID::parse_mergeable`].
+    ///
+    /// Called from [`Self::init_with_states_and_version`] right after a
+    /// snapshot decode so the imported doc's deep value, path lookups, and
+    /// reachability checks see mergeable children without requiring the caller
+    /// to re-invoke `get_mergeable_*` on every nested key.
+    fn repopulate_mergeable_child_side_tables(&mut self) {
+        // Collect all mergeable cids first so we don't hold an iterator borrow
+        // while mutating MapStates below.
+        let mergeable: Vec<ContainerID> = self
+            .store
+            .iter_all_container_ids()
+            .filter(|id| id.is_mergeable())
+            .collect();
+
+        for cid in mergeable {
+            let Some((parent_id, key, _kind)) = cid.parse_mergeable() else {
+                continue;
+            };
+            // Ensure the parent container exists in the store; it normally
+            // does (the mergeable child was created by writing to it), but
+            // `ensure_container` is idempotent and cheap when present.
+            self.store.ensure_container(&parent_id);
+            let parent_idx = self.arena.register_container(&parent_id);
+            // Also make sure the arena parent edge is wired. Re-registering
+            // the mergeable cid is idempotent and will set the parent via
+            // `parse_mergeable` if it wasn't already set.
+            self.arena.register_container(&cid);
+
+            if let Some(state) = self.store.get_container_mut(parent_idx) {
+                if let Some(map) = state.as_map_state_mut() {
+                    map.register_mergeable_child(key.into(), cid);
+                }
+            }
+        }
+    }
+
     pub(crate) fn get_value_by_idx(&mut self, container_idx: ContainerIdx) -> LoroValue {
         self.store
             .get_value(container_idx)
@@ -859,6 +905,17 @@ impl DocState {
                 }
             }
         }
+
+        // Re-register mergeable child containers in their parent MapState's
+        // side table. Mergeable children are real containers with their own
+        // state entries in KV (so they round-trip through snapshot), but the
+        // `MapState::child_containers` side table that drives deep-value walks
+        // and path resolution is NOT serialized (see
+        // `MapState::encode_snapshot_fast`). After import we walk all known
+        // container IDs, find the mergeable ones, and call
+        // `register_mergeable_child` on their parent MapStates to rebuild
+        // that side table from the deterministic cids.
+        self.repopulate_mergeable_child_side_tables();
 
         if !unknown_containers.is_empty() {
             let mut diff_calc = DiffCalculator::new(false);

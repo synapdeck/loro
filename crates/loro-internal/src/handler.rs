@@ -4218,6 +4218,32 @@ impl MapHandler {
             MaybeDetached::Detached(_) => self.get_or_create_container(key, child),
             MaybeDetached::Attached(parent) => {
                 let cid = ContainerID::new_mergeable(&parent.id, key, child.kind());
+                let key_istr: InternalString = key.into();
+                // Reject type-mismatch requests up front: if a mergeable child was previously
+                // registered under `key` with a different container type, the new request must
+                // error out instead of silently creating a second container with a divergent
+                // deterministic cid. Without this check `get_mergeable_text("k")` followed by
+                // `get_mergeable_map("k")` would produce two unrelated containers that both look
+                // "right" to their callers but cause inconsistent state across peers.
+                let existing = parent.with_state(|state| {
+                    state
+                        .as_map_state()
+                        .expect("mergeable children can only be attached to map containers")
+                        .get_mergeable_child_id(&key_istr)
+                        .cloned()
+                });
+                if let Some(existing_id) = existing {
+                    if existing_id.container_type() != child.kind() {
+                        return Err(LoroError::ArgErr(
+                            format!(
+                                "Expected value type {} but found {}",
+                                child.kind(),
+                                existing_id.container_type()
+                            )
+                            .into_boxed_str(),
+                        ));
+                    }
+                }
                 // Register the mergeable cid in the parent MapState's child side table so it
                 // shows up for deep-value, path resolution, reachability, deletion, and child-
                 // enumeration walks. We deliberately do NOT encode a `MapSet(key, Container(cid))`
@@ -4228,7 +4254,7 @@ impl MapHandler {
                     state
                         .as_map_state_mut()
                         .expect("mergeable children can only be attached to map containers")
-                        .register_mergeable_child(key.into(), cid.clone());
+                        .register_mergeable_child(key_istr, cid.clone());
                 });
                 C::from_handler(create_handler(parent, cid.clone())).ok_or_else(|| {
                     LoroError::ArgErr(
