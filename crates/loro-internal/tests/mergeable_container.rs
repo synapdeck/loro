@@ -843,3 +843,39 @@ fn undo_manager_reverts_mergeable_counter_mutation() {
     assert_eq!(counter.get_value().to_json_value(), json!(0.0),
         "undo must revert the increment");
 }
+
+/// Calling `MapHandler::delete(key)` on a key that has a mergeable child
+/// registered is a semantic no-op: the mergeable child lives in the side
+/// table, not the value map, so the `MapSet` tombstone has nothing to
+/// overwrite. The side-table entry survives, the counter value remains
+/// visible in `get_deep_value`, and re-resolving the handler returns the
+/// same deterministic cid.
+#[test]
+#[cfg(feature = "counter")]
+fn delete_on_mergeable_child_key_observed_behavior() {
+    let doc = doc(1);
+    let root = doc.get_map("state");
+    let counter = root.get_mergeable_counter("revision").unwrap();
+    counter.increment(3.0).unwrap();
+    doc.commit_then_renew();
+    assert_eq!(
+        doc.get_deep_value().to_json_value(),
+        json!({ "state": { "revision": 3.0 } })
+    );
+
+    let delete_result = root.delete("revision");
+    assert!(delete_result.is_ok(), "delete must not error");
+    doc.commit_then_renew();
+
+    // Side table wins: the counter is still visible after delete.
+    assert_eq!(
+        doc.get_deep_value().to_json_value(),
+        json!({ "state": { "revision": 3.0 } }),
+        "delete on a mergeable key must be a no-op against side-table entries",
+    );
+
+    // Whatever delete did, the doc must not be corrupted. Re-resolving the counter must produce
+    // the same deterministic cid and the doc stays usable.
+    let counter2 = root.get_mergeable_counter("revision").unwrap();
+    assert_eq!(counter2.id(), counter.id());
+}
