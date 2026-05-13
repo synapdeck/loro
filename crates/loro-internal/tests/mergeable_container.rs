@@ -763,3 +763,35 @@ fn detached_map_get_mergeable_counter_falls_back_cleanly() {
     // The detached handler still surfaces the value through its local state.
     assert_eq!(counter.get_value().to_json_value(), json!(7.0));
 }
+
+/// Key encoding is len-prefixed binary, so it must round-trip cleanly for
+/// degenerate inputs: empty, long, embedded NUL, and embedded mergeable
+/// prefix substring. Catches off-by-one and ad-hoc string-split mistakes
+/// in any future decoder change.
+#[test]
+fn mergeable_cid_roundtrips_for_degenerate_keys() {
+    use loro_common::{ContainerID, ContainerType};
+    let parent = ContainerID::new_root("state", ContainerType::Map);
+
+    let long_key: String = std::iter::repeat('k').take(2048).collect();
+    let cases: Vec<&str> = vec![
+        "",
+        long_key.as_str(),
+        "with\0nul\0bytes",
+        "embedded 🤝: substring in the middle",
+        "starts_with_🤝:_prefix",
+        "trailing_emoji_🤝:",
+        "ascii/slash/looking",
+    ];
+
+    for key in cases {
+        let cid = ContainerID::new_mergeable(&parent, key, ContainerType::Map);
+        assert!(cid.is_mergeable(), "key {key:?}: must be mergeable");
+        let (decoded_parent, decoded_key, decoded_kind) = cid
+            .parse_mergeable()
+            .unwrap_or_else(|| panic!("key {key:?}: parse_mergeable returned None"));
+        assert_eq!(decoded_parent, parent);
+        assert_eq!(decoded_key, key, "key {key:?}: round-trip mismatch");
+        assert_eq!(decoded_kind, ContainerType::Map);
+    }
+}
