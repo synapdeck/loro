@@ -1721,3 +1721,45 @@ fn concurrent_increment_resurrects_after_delete() {
         "increment past tombstone reattaches the cid; state is preserved (not reset)"
     );
 }
+
+/// Concurrent increment + delete with delete-higher-IdLp: no op past the
+/// tombstone, so the cid stays evicted. Counter is not visible in deep
+/// value. KV state is preserved (1.0) but unreachable from the parent.
+#[test]
+#[cfg(feature = "counter")]
+fn concurrent_delete_wins_against_earlier_increment() {
+    let a = doc(1);
+    let b = doc(2);
+
+    let a_root = a.get_map("state");
+    let a_counter = a_root.get_mergeable_counter("revision").unwrap();
+    a_counter.increment(1.0).unwrap();
+    a.commit_then_renew();
+    sync(&a, &b);
+
+    // B increments first (low IdLp).
+    let b_root = b.get_map("state");
+    let b_counter = b_root.get_mergeable_counter("revision").unwrap();
+    b_counter.increment(100.0).unwrap();
+    b.commit_then_renew();
+
+    // A advances its clock past B's increment, then deletes.
+    for i in 0..5 {
+        a_root.insert(&format!("noise_{i}"), i).unwrap();
+        a.commit_then_renew();
+    }
+    a_root.delete("revision").unwrap();
+    a.commit_then_renew();
+
+    sync(&a, &b);
+
+    let va = a.get_deep_value().to_json_value();
+    let vb = b.get_deep_value().to_json_value();
+    assert_eq!(va, vb);
+
+    // Counter not visible. Both peers agree.
+    assert!(
+        va["state"].get("revision").is_none(),
+        "delete with higher IdLp must dominate; got {va}"
+    );
+}
