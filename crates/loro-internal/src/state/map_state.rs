@@ -21,6 +21,18 @@ pub struct MapState {
     idx: ContainerIdx,
     map: BTreeMap<InternalString, MapValue>,
     child_containers: FxHashMap<ContainerID, InternalString>,
+    /// Tombstones for keys whose mergeable child was deleted via
+    /// `MapSet { key, value: None }`. Maps each deleted key to the IdLp of the deleting op.
+    ///
+    /// A mergeable cid registered under a key is reachable (in `child_containers`) iff there is
+    /// no tombstone for that key OR the cid's `max_op_idlp > tombstone_idlp`. See
+    /// [`DocState::mergeable_max_op_idlp`] and the registration gate in
+    /// [`DocState::register_mergeable_children`].
+    ///
+    /// This field is not serialized as a distinct snapshot field; it is recomputed on snapshot
+    /// import from the parent map's existing value table (`map` entries with
+    /// `MapValue { value: None, .. }`).
+    mergeable_tombstones: FxHashMap<InternalString, IdLp>,
     size: usize,
 }
 
@@ -169,6 +181,7 @@ impl MapState {
             idx,
             map: Default::default(),
             child_containers: Default::default(),
+            mergeable_tombstones: Default::default(),
             size: 0,
         }
     }
@@ -325,6 +338,40 @@ impl MapState {
             .iter()
             .find(|(id, k)| id.is_mergeable() && *k == key)
             .map(|(id, _)| id)
+    }
+
+    /// Return the tombstone IdLp for the given key, if any.
+    pub(crate) fn mergeable_tombstone(&self, key: &InternalString) -> Option<IdLp> {
+        self.mergeable_tombstones.get(key).copied()
+    }
+
+    /// Set or update the tombstone for `key`. Monotonic: a later tombstone
+    /// (higher IdLp) replaces an earlier one; an earlier tombstone never
+    /// overwrites a later one. This matches the LWW semantic for deletes
+    /// across concurrent peers.
+    pub(crate) fn set_mergeable_tombstone(&mut self, key: InternalString, idlp: IdLp) {
+        let entry = self.mergeable_tombstones.entry(key).or_insert(idlp);
+        if idlp > *entry {
+            *entry = idlp;
+        }
+    }
+
+    /// Iterate all `(key, idlp)` tombstone pairs. Used by the post-loop reconciliation hook to
+    /// walk tombstones recorded during the current import batch.
+    pub(crate) fn iter_mergeable_tombstones(
+        &self,
+    ) -> impl Iterator<Item = (&InternalString, &IdLp)> {
+        self.mergeable_tombstones.iter()
+    }
+
+    /// Evict a specific mergeable cid from the side table. Returns true if the cid was
+    /// registered and removed; false if it wasn't present.
+    ///
+    /// The caller decides WHICH cids to evict based on tombstone domination. Eviction is per-cid
+    /// rather than per-key because mixed reachable/dominated states under the same key require
+    /// keeping the reachable cids while dropping the dominated ones.
+    pub(crate) fn evict_mergeable_child_cid(&mut self, cid: &ContainerID) -> bool {
+        self.child_containers.remove(cid).is_some()
     }
 }
 
