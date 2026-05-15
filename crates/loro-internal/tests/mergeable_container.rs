@@ -944,6 +944,32 @@ fn delete_on_mergeable_child_key_observed_behavior() {
     assert_eq!(counter2.id(), counter.id());
 }
 
+/// After `delete` on a mergeable key, the child does not appear in
+/// deep value. The mergeable cid has been evicted from the side table
+/// because its max-op-idlp is <= the tombstone.
+#[test]
+#[cfg(feature = "counter")]
+fn delete_on_mergeable_key_removes_child_from_deep_value() {
+    let doc = doc(1);
+    let root = doc.get_map("state");
+    let counter = root.get_mergeable_counter("revision").unwrap();
+    counter.increment(3.0).unwrap();
+    doc.commit_then_renew();
+    assert_eq!(
+        doc.get_deep_value().to_json_value(),
+        json!({ "state": { "revision": 3.0 } })
+    );
+
+    root.delete("revision").unwrap();
+    doc.commit_then_renew();
+
+    assert_eq!(
+        doc.get_deep_value().to_json_value(),
+        json!({ "state": {} }),
+        "after delete, mergeable child must not appear in deep value"
+    );
+}
+
 /// `LoroDoc::has_container(cid)` must return `false` for a mergeable cid
 /// that has never been written to, and `true` after the child has been
 /// mutated. Mergeable existence depends on state, not on the name shape, so

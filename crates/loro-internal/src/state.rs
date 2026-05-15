@@ -927,33 +927,55 @@ impl DocState {
             }
         }
 
-        // Pass 2: for each group, look up first-op IdLp per cid (read-only on `self.store` and
-        // `oplog`), then pick the LWW winner. Cids with no ops yet (`None` from
-        // `mergeable_first_op_idlp`) defer — they aren't registered; their conflict, if any, will
-        // be re-resolved once ops arrive. This preserves the invariant that an unmutated
-        // mergeable child does not round-trip through a snapshot.
+        // Pass 2: for each group, look up first-op IdLp (for the LWW winner) and max-op IdLp
+        // (for the tombstone reachability gate) per cid, then pick the LWW winner among
+        // tombstone-reachable candidates. Cids with no ops yet defer — they aren't registered;
+        // their conflict, if any, is re-resolved once ops arrive. This preserves the invariant
+        // that an unmutated mergeable child does not round-trip through a snapshot.
         let mut decisions: Vec<(ContainerID, InternalString, ContainerID)> = Vec::new();
         for ((parent_id, key), candidates) in by_key {
-            // Decorate each candidate with its first-op IdLp.
-            let mut with_idlp: Vec<(ContainerID, Option<IdLp>)> = candidates
+            // Look up the parent's tombstone for this key, if any. Read-only
+            // on the MapState; we don't mutate yet.
+            let tombstone: Option<IdLp> = {
+                let parent_idx = self.arena.id_to_idx(&parent_id);
+                match parent_idx {
+                    Some(idx) => self
+                        .store
+                        .get_container_mut(idx)
+                        .and_then(|state| state.as_map_state())
+                        .and_then(|map_state| map_state.mergeable_tombstone(&key)),
+                    None => None,
+                }
+            };
+
+            // Decorate each candidate with its first-op IdLp (used for LWW winner selection) and
+            // max-op IdLp (used for the tombstone reachability gate). Drop candidates with no ops
+            // yet — they can't beat any tombstone, and LWW also needs a first-op to compare.
+            // Deferred candidates re-resolve once ops arrive.
+            let mut decorated: Vec<(ContainerID, IdLp, IdLp)> = candidates
                 .into_iter()
-                .map(|cid| {
-                    let idlp = self.mergeable_first_op_idlp(oplog, &cid);
-                    (cid, idlp)
+                .filter_map(|cid| {
+                    let first = self.mergeable_first_op_idlp(oplog, &cid)?;
+                    let max = self.mergeable_max_op_idlp(oplog, &cid)?;
+                    Some((cid, first, max))
                 })
                 .collect();
 
-            // Filter to cids that have an applied op (Some(idlp)). Unmutated
-            // competitors defer: skip registration entirely.
-            with_idlp.retain(|(_, idlp)| idlp.is_some());
+            // Filter by tombstone reachability BEFORE LWW selection. Filtering after LWW
+            // selection could leave the winner dominated while discarding reachable losers;
+            // filtering first picks among the surviving reachable candidates.
+            if let Some(t) = tombstone {
+                decorated.retain(|(_, _, max_idlp)| *max_idlp > t);
+            }
 
-            if with_idlp.is_empty() {
+            if decorated.is_empty() {
                 continue;
             }
 
-            // Sort by IdLp ascending; the LAST one (max IdLp) is the LWW winner.
-            with_idlp.sort_by_key(|(_, idlp)| *idlp);
-            let (winner, _) = with_idlp.pop().unwrap();
+            // LWW: pick the candidate with the largest first-op IdLp (the most-recent established
+            // claim).
+            decorated.sort_by_key(|(_, first, _)| *first);
+            let (winner, _, _) = decorated.pop().unwrap();
             decisions.push((parent_id, key, winner));
         }
 
