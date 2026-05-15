@@ -908,15 +908,14 @@ fn undo_manager_reverts_mergeable_counter_mutation() {
     );
 }
 
-/// Calling `MapHandler::delete(key)` on a key that has a mergeable child
-/// registered is a semantic no-op: the mergeable child lives in the side
-/// table, not the value map, so the `MapSet` tombstone has nothing to
-/// overwrite. The side-table entry survives, the counter value remains
-/// visible in `get_deep_value`, and re-resolving the handler returns the
-/// same deterministic cid.
+/// Calling `MapHandler::delete(key)` on a key holding a mergeable child evicts the side-table
+/// entry via tombstoning: the child no longer appears in deep value. The child's underlying KV
+/// state IS preserved (delete detaches rather than destroys). A subsequent `get_mergeable_*`
+/// call returns a handler to that preserved state, but the child stays hidden from deep-value
+/// walks until a new op with IdLp > tombstone arrives.
 #[test]
 #[cfg(feature = "counter")]
-fn delete_on_mergeable_child_key_observed_behavior() {
+fn delete_on_mergeable_child_key_detaches_and_preserves_state() {
     let doc = doc(1);
     let root = doc.get_map("state");
     let counter = root.get_mergeable_counter("revision").unwrap();
@@ -927,21 +926,43 @@ fn delete_on_mergeable_child_key_observed_behavior() {
         json!({ "state": { "revision": 3.0 } })
     );
 
-    let delete_result = root.delete("revision");
-    assert!(delete_result.is_ok(), "delete must not error");
+    root.delete("revision").unwrap();
     doc.commit_then_renew();
 
-    // Side table wins: the counter is still visible after delete.
+    // Detached: not in deep value.
     assert_eq!(
         doc.get_deep_value().to_json_value(),
-        json!({ "state": { "revision": 3.0 } }),
-        "delete on a mergeable key must be a no-op against side-table entries",
+        json!({ "state": {} }),
+        "delete must evict the mergeable child from deep value"
     );
 
-    // Whatever delete did, the doc must not be corrupted. Re-resolving the counter must produce
-    // the same deterministic cid and the doc stays usable.
+    // State is preserved in KV. Re-getting the counter resolves to the same deterministic cid;
+    // the handle works; the value is the PRIOR value (3.0), not a reset to 0.0.
     let counter2 = root.get_mergeable_counter("revision").unwrap();
-    assert_eq!(counter2.id(), counter.id());
+    assert_eq!(counter2.id(), counter.id(), "deterministic cid is stable");
+    assert_eq!(
+        counter2.get_value().to_json_value(),
+        json!(3.0),
+        "re-get after delete sees preserved state, not reset state"
+    );
+
+    // The counter is still NOT in deep value (no post-tombstone op has
+    // re-registered the cid yet).
+    assert_eq!(
+        doc.get_deep_value().to_json_value(),
+        json!({ "state": {} }),
+        "re-getting the handle does not resurrect the cid; only a post-tombstone op does"
+    );
+
+    // Issuing a new op (any op) re-registers the cid via the
+    // resurrection path.
+    counter2.increment(10.0).unwrap();
+    doc.commit_then_renew();
+    assert_eq!(
+        doc.get_deep_value().to_json_value(),
+        json!({ "state": { "revision": 13.0 } }),
+        "post-tombstone increment resurrects the cid; value is preserved + new increment"
+    );
 }
 
 /// After `delete` on a mergeable key, the child does not appear in
