@@ -14,7 +14,12 @@
 use loro_common::{ContainerID, ContainerType, IdLp, InternalString};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::{container::idx::ContainerIdx, OpLog};
+use crate::{
+    container::{idx::ContainerIdx, map::MapSet},
+    event::InternalContainerDiff,
+    op::{Op, RawOp, RawOpContent},
+    OpLog,
+};
 
 use super::DocState;
 
@@ -375,6 +380,116 @@ impl DocState {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Capture the mergeable cids and parent map idxs present in a diff batch.
+    ///
+    /// The batch carries newly-arrived cids and any parent maps touched by the import. The
+    /// caller threads the returned values into the post-loop hooks
+    /// ([`Self::register_mergeable_children`] and
+    /// [`Self::reconcile_mergeable_tombstones_for`]) so update-import cost stays proportional
+    /// to the diff size.
+    pub(super) fn capture_mergeable_diff_batch(
+        &mut self,
+        diffs: &[InternalContainerDiff],
+    ) -> (Vec<ContainerID>, FxHashSet<ContainerIdx>) {
+        let mergeable_to_register = diffs
+            .iter()
+            .filter_map(|d| self.arena.idx_to_id(d.idx))
+            .filter(|id| id.is_mergeable())
+            .collect();
+        let map_parent_idxs = diffs
+            .iter()
+            .filter(|d| {
+                self.store
+                    .get_container(d.idx)
+                    .is_some_and(|s| s.as_map_state().is_some())
+            })
+            .map(|d| d.idx)
+            .collect();
+        (mergeable_to_register, map_parent_idxs)
+    }
+
+    /// On a value-clearing `MapSet` op (a delete) issued locally, evict every mergeable child
+    /// cid currently registered under the cleared key.
+    ///
+    /// The normal `deleted_containers` path only handles regular `MapValue::Container` entries;
+    /// mergeable children are not in the value table, so they need explicit local-side
+    /// eviction.
+    ///
+    /// For a LOCAL delete, the tombstone IdLp is this op's IdLp — the newest IdLp the local
+    /// clock has produced — so every cid currently registered under the key is dominated.
+    /// Remote reconciliation does a per-cid reachability check because remote tombstones may
+    /// be older.
+    pub(super) fn evict_mergeable_children_on_local_delete(&mut self, raw_op: &RawOp, op: &Op) {
+        let RawOpContent::Map(MapSet { key, value }) = &raw_op.content else {
+            return;
+        };
+        if value.is_some() {
+            return;
+        }
+
+        let cids_to_evict: Vec<ContainerID> = self
+            .store
+            .get_container_mut(op.container)
+            .and_then(|parent_state| parent_state.as_map_state())
+            .map(|map_state| map_state.mergeable_child_ids_for_key(key))
+            .unwrap_or_default();
+        if cids_to_evict.is_empty() {
+            return;
+        }
+
+        if let Some(map_state) = self
+            .store
+            .get_container_mut(op.container)
+            .and_then(|parent_state| parent_state.as_map_state_mut())
+        {
+            for cid in &cids_to_evict {
+                map_state.evict_mergeable_child_cid(cid);
+            }
+        }
+        self.dead_containers_cache.clear_alive();
+    }
+
+    /// If this op targets a mergeable child container whose parent has a tombstone for the
+    /// child's key, and the op's IdLp dominates the tombstone, re-register the cid in the
+    /// parent's side table.
+    ///
+    /// This is the local analog of the remote [`Self::register_mergeable_children`] path; it
+    /// lets a post-tombstone local mutation resurrect the cid without round-tripping through
+    /// `apply_diff`. Gated on a tombstone existing to avoid double-registering in the no-
+    /// tombstone case, where `handler::get_mergeable_container` already (un)registered at
+    /// handler-creation time.
+    pub(super) fn resurrect_mergeable_on_post_tombstone_op(&mut self, raw_op: &RawOp, op: &Op) {
+        let Some(cid) = self.arena.idx_to_id(op.container) else {
+            return;
+        };
+        if !cid.is_mergeable() {
+            return;
+        }
+        let Some((parent_id, key, _kind)) = cid.parse_mergeable() else {
+            return;
+        };
+        let key_istr: InternalString = key.into();
+        let parent_idx = self.arena.register_container(&parent_id);
+
+        let tombstone: Option<IdLp> = self
+            .store
+            .get_container_mut(parent_idx)
+            .and_then(|state| state.as_map_state())
+            .and_then(|map_state| map_state.mergeable_tombstone(&key_istr));
+        let Some(tombstone) = tombstone else {
+            return;
+        };
+        if raw_op.idlp() <= tombstone {
+            return;
+        }
+
+        if let Some(state) = self.store.get_container_mut(parent_idx) {
+            if let Some(map_state) = state.as_map_state_mut() {
+                map_state.register_mergeable_child(key_istr, cid.clone());
+            }
+        }
     }
 }
 
