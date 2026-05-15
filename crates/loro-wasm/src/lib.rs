@@ -3274,6 +3274,66 @@ impl LoroMap {
         Ok(handler_to_js_value(c, false).into())
     }
 
+    /// Get or create a mergeable Counter under the given key.
+    ///
+    /// Mergeable child containers converge on concurrent first-write across peers and support
+    /// detachment-style delete semantics: a `delete` on the key detaches the child; the child's
+    /// KV state persists; a subsequent op past the tombstone IdLp resurrects the child.
+    ///
+    /// @example
+    /// ```ts
+    /// import { LoroDoc } from "loro-crdt";
+    ///
+    /// const doc = new LoroDoc();
+    /// const counter = doc.getMap("state").getMergeableCounter("revision");
+    /// counter.increment(1);
+    /// ```
+    #[wasm_bindgen(js_name = "getMergeableCounter")]
+    pub fn get_mergeable_counter(&self, key: &str) -> JsResult<LoroCounter> {
+        let handler = self.handler.get_mergeable_counter(key)?;
+        Ok(LoroCounter { handler })
+    }
+
+    /// Get or create a mergeable Map under the given key.
+    /// See `getMergeableCounter` for semantics.
+    #[wasm_bindgen(js_name = "getMergeableMap")]
+    pub fn get_mergeable_map(&self, key: &str) -> JsResult<LoroMap> {
+        let handler = self.handler.get_mergeable_map(key)?;
+        Ok(LoroMap { handler })
+    }
+
+    /// Get or create a mergeable List under the given key.
+    /// See `getMergeableCounter` for semantics.
+    #[wasm_bindgen(js_name = "getMergeableList")]
+    pub fn get_mergeable_list(&self, key: &str) -> JsResult<LoroList> {
+        let handler = self.handler.get_mergeable_list(key)?;
+        Ok(LoroList { handler })
+    }
+
+    /// Get or create a mergeable MovableList under the given key.
+    /// See `getMergeableCounter` for semantics.
+    #[wasm_bindgen(js_name = "getMergeableMovableList")]
+    pub fn get_mergeable_movable_list(&self, key: &str) -> JsResult<LoroMovableList> {
+        let handler = self.handler.get_mergeable_movable_list(key)?;
+        Ok(LoroMovableList { handler })
+    }
+
+    /// Get or create a mergeable Text under the given key.
+    /// See `getMergeableCounter` for semantics.
+    #[wasm_bindgen(js_name = "getMergeableText")]
+    pub fn get_mergeable_text(&self, key: &str) -> JsResult<LoroText> {
+        let handler = self.handler.get_mergeable_text(key)?;
+        Ok(LoroText { handler })
+    }
+
+    /// Get or create a mergeable Tree under the given key.
+    /// See `getMergeableCounter` for semantics.
+    #[wasm_bindgen(js_name = "getMergeableTree")]
+    pub fn get_mergeable_tree(&self, key: &str) -> JsResult<LoroTree> {
+        let handler = self.handler.get_mergeable_tree(key)?;
+        Ok(LoroTree { handler })
+    }
+
     /// Subscribe to the changes of the map.
     ///
     /// Returns a subscription callback, which can be used to unsubscribe.
