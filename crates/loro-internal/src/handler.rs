@@ -4214,60 +4214,85 @@ impl MapHandler {
     /// because the cid carries `child.kind()`; the check guards against
     /// future drift between `from_handler` and `kind`.
     fn get_mergeable_container<C: HandlerTrait>(&self, key: &str, child: C) -> LoroResult<C> {
-        match &self.inner {
-            MaybeDetached::Detached(_) => self.get_or_create_container(key, child),
-            MaybeDetached::Attached(parent) => {
-                let cid = ContainerID::new_mergeable(&parent.id, key, child.kind());
-                let key_istr: InternalString = key.into();
-                // Reject type-mismatch requests up front: if a mergeable child was previously
-                // registered under `key` with a different container type, the new request must
-                // error out instead of silently creating a second container with a divergent
-                // deterministic cid. Without this check `get_mergeable_text("k")` followed by
-                // `get_mergeable_map("k")` would produce two unrelated containers that both look
-                // "right" to their callers but cause inconsistent state across peers.
-                let existing = parent.with_state(|state| {
-                    state
-                        .as_map_state()
-                        .expect("mergeable children can only be attached to map containers")
-                        .get_mergeable_child_id(&key_istr)
-                        .cloned()
+        let MaybeDetached::Attached(parent) = &self.inner else {
+            return self.get_or_create_container(key, child);
+        };
+        let cid = ContainerID::new_mergeable(&parent.id, key, child.kind());
+        let key_istr: InternalString = key.into();
+
+        // Resolve the type-mismatch check, tombstone gate, and side-table registration under
+        // a single state-lock acquisition. The oplog lock is taken first to respect the crate-
+        // wide `oplog -> state` order.
+        let doc = parent.doc();
+        let oplog = doc.oplog().lock();
+        let resolution = parent.with_doc_state(|doc_state| {
+            let (existing, tombstone) =
+                doc_state.with_state_mut(parent.container_idx, |state| {
+                    let map = state
+                        .as_map_state_mut()
+                        .expect("mergeable children can only be attached to map containers");
+                    (
+                        map.get_mergeable_child_id(&key_istr).cloned(),
+                        map.mergeable_tombstone(&key_istr),
+                    )
                 });
-                if let Some(existing_id) = existing {
-                    if existing_id.container_type() != child.kind() {
-                        return Err(LoroError::ArgErr(
-                            format!(
-                                "Mergeable key resolved to type {} (via local creation or import-time LWW); cannot return type {}",
-                                existing_id.container_type(),
-                                child.kind(),
-                            )
-                            .into_boxed_str(),
-                        ));
-                    }
+
+            // Type-mismatch: reject if a different kind is already registered under `key`.
+            // Without this check `get_mergeable_text("k")` followed by `get_mergeable_map("k")`
+            // would produce two unrelated containers that both look "right" to their callers
+            // but cause inconsistent state across peers.
+            if let Some(existing_id) = &existing {
+                if existing_id.container_type() != child.kind() {
+                    return Err(LoroError::ArgErr(
+                        format!(
+                            "Mergeable key resolved to type {} (via local creation or import-time LWW); cannot return type {}",
+                            existing_id.container_type(),
+                            child.kind(),
+                        )
+                        .into_boxed_str(),
+                    ));
                 }
+            }
+
+            // Tombstone gate: do not let a plain `get_mergeable_*` re-register a cid whose
+            // newest op is still dominated by an existing tombstone. The handler remains
+            // usable for reading preserved KV state; a future post-tombstone mutation will
+            // resurrect the cid via the local-op path.
+            let should_register = match tombstone {
+                None => true,
+                Some(tombstone) => doc_state
+                    .mergeable_max_op_idlp(&oplog, &cid)
+                    .is_some_and(|max_op_idlp| max_op_idlp > tombstone),
+            };
+            if should_register {
                 // Register the mergeable cid in the parent MapState's child side table so it
-                // shows up for deep-value, path resolution, reachability, deletion, and child-
-                // enumeration walks. We deliberately do NOT encode a `MapSet(key, Container(cid))`
-                // op here — see `MapState::register_mergeable_child` for the reasoning.
-                // `create_handler` below also registers the cid in the arena with the parent edge
-                // wired up, so the arena and MapState views agree afterwards.
-                parent.with_state(|state| {
+                // shows up for deep-value, path resolution, reachability, deletion, and
+                // child-enumeration walks. We deliberately do NOT encode a
+                // `MapSet(key, Container(cid))` op here — see `MapState::register_mergeable_child`
+                // for the reasoning. `create_handler` below also registers the cid in the
+                // arena with the parent edge wired up, so the arena and MapState views agree.
+                doc_state.with_state_mut(parent.container_idx, |state| {
                     state
                         .as_map_state_mut()
                         .expect("mergeable children can only be attached to map containers")
                         .register_mergeable_child(key_istr, cid.clone());
                 });
-                C::from_handler(create_handler(parent, cid.clone())).ok_or_else(|| {
-                    LoroError::ArgErr(
-                        format!(
-                            "Expected value type {} but found {}",
-                            child.kind(),
-                            cid.container_type()
-                        )
-                        .into_boxed_str(),
-                    )
-                })
             }
-        }
+            Ok(())
+        });
+        drop(oplog);
+        resolution?;
+
+        C::from_handler(create_handler(parent, cid.clone())).ok_or_else(|| {
+            LoroError::ArgErr(
+                format!(
+                    "Expected value type {} but found {}",
+                    child.kind(),
+                    cid.container_type()
+                )
+                .into_boxed_str(),
+            )
+        })
     }
 
     #[cfg(feature = "counter")]

@@ -1380,3 +1380,39 @@ fn local_delete_immediately_evicts_mergeable_side_table() {
         "local delete must remove the mergeable child from deep value"
     );
 }
+
+/// After local `delete`, calling `get_mergeable_*` on the same key
+/// returns a working handler but does NOT re-register the cid in the
+/// side table. Deep value still hides the child until a post-tombstone
+/// op arrives.
+#[test]
+#[cfg(feature = "counter")]
+fn get_mergeable_after_delete_does_not_resurrect() {
+    let doc = doc(1);
+    let root = doc.get_map("state");
+    let counter = root.get_mergeable_counter("revision").unwrap();
+    counter.increment(1.0).unwrap();
+    doc.commit_then_renew();
+
+    root.delete("revision").unwrap();
+    doc.commit_then_renew();
+    assert_eq!(doc.get_deep_value().to_json_value(), json!({ "state": {} }));
+
+    // Re-get returns a working handler. The cid is the same (deterministic).
+    let counter2 = root.get_mergeable_counter("revision").unwrap();
+    assert_eq!(counter2.id(), counter.id(), "deterministic cid is stable");
+
+    // But the cid is NOT re-registered. Deep value still hides it.
+    assert_eq!(
+        doc.get_deep_value().to_json_value(),
+        json!({ "state": {} }),
+        "re-get must not bypass the tombstone gate"
+    );
+
+    // The handler still works (reads preserved KV state).
+    assert_eq!(
+        counter2.get_value().to_json_value(),
+        json!(1.0),
+        "handler reads preserved KV state"
+    );
+}
