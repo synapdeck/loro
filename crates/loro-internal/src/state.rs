@@ -785,6 +785,42 @@ impl DocState {
             self.dead_containers_cache.clear_alive();
         }
 
+        // If this op is a value-clearing MapSet on a parent map that has a
+        // mergeable child registered under the key, evict the side-table entry
+        // immediately. The normal `deleted_containers` path only handles
+        // regular `MapValue::Container` entries; mergeable children are not in
+        // the value table, so they need explicit local-side eviction.
+        //
+        // For a LOCAL delete, the tombstone IdLp is this op's IdLp, which is
+        // the newest IdLp the local clock has produced, so every cid currently
+        // registered under this key is dominated. Remote reconciliation does a
+        // per-cid reachability check because remote tombstones may be older.
+        if let crate::op::RawOpContent::Map(crate::container::map::MapSet { key, value }) =
+            &raw_op.content
+        {
+            if value.is_none() {
+                let cids_to_evict: Vec<ContainerID> = self
+                    .store
+                    .get_container_mut(op.container)
+                    .and_then(|parent_state| parent_state.as_map_state())
+                    .map(|map_state| map_state.mergeable_child_ids_for_key(key))
+                    .unwrap_or_default();
+
+                if !cids_to_evict.is_empty() {
+                    if let Some(map_state) = self
+                        .store
+                        .get_container_mut(op.container)
+                        .and_then(|parent_state| parent_state.as_map_state_mut())
+                    {
+                        for cid in &cids_to_evict {
+                            map_state.evict_mergeable_child_cid(cid);
+                        }
+                    }
+                    self.dead_containers_cache.clear_alive();
+                }
+            }
+        }
+
         Ok(())
     }
 

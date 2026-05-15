@@ -1354,3 +1354,29 @@ fn delete_on_mergeable_key_records_tombstone() {
         "tombstone lamport must be > 0 after a delete"
     );
 }
+
+/// A local `delete` on a mergeable key must evict the side-table entry
+/// immediately, not wait for a remote import cycle. The child stops
+/// appearing in deep value right after `commit_then_renew`.
+#[test]
+#[cfg(feature = "counter")]
+fn local_delete_immediately_evicts_mergeable_side_table() {
+    let doc = doc(1);
+    let root = doc.get_map("state");
+    let counter = root.get_mergeable_counter("revision").unwrap();
+    counter.increment(1.0).unwrap();
+    doc.commit_then_renew();
+    assert_eq!(
+        doc.get_deep_value().to_json_value(),
+        json!({ "state": { "revision": 1.0 } })
+    );
+
+    root.delete("revision").unwrap();
+    doc.commit_then_renew();
+
+    assert_eq!(
+        doc.get_deep_value().to_json_value(),
+        json!({ "state": {} }),
+        "local delete must remove the mergeable child from deep value"
+    );
+}
