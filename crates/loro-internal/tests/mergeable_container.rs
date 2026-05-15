@@ -1669,3 +1669,55 @@ fn three_peer_delete_resurrect_with_competing_kinds() {
         "C must converge"
     );
 }
+
+/// Concurrent delete + increment with increment-higher-IdLp: the
+/// increment's op carries the cid past the tombstone, so the side
+/// table re-registers the cid, and the counter remains visible.
+#[test]
+#[cfg(feature = "counter")]
+fn concurrent_increment_resurrects_after_delete() {
+    let a = doc(1);
+    let b = doc(2);
+
+    let a_root = a.get_map("state");
+    let a_counter = a_root.get_mergeable_counter("revision").unwrap();
+    a_counter.increment(1.0).unwrap();
+    a.commit_then_renew();
+    sync(&a, &b);
+
+    // A deletes the counter at some IdLp L_a.
+    a_root.delete("revision").unwrap();
+    a.commit_then_renew();
+
+    // B has not seen A's delete yet. B advances its own lamport clock by
+    // doing some unrelated ops, then increments. B's increment IdLp will
+    // be > A's delete IdLp.
+    for i in 0..5 {
+        b.get_map("state").insert(&format!("noise_{i}"), i).unwrap();
+        b.commit_then_renew();
+    }
+    let b_counter = b.get_map("state").get_mergeable_counter("revision").unwrap();
+    b_counter.increment(100.0).unwrap();
+    b.commit_then_renew();
+
+    // Sync. Both peers receive each other's ops.
+    sync(&a, &b);
+
+    let va = a.get_deep_value().to_json_value();
+    let vb = b.get_deep_value().to_json_value();
+    assert_eq!(va, vb, "peers must converge");
+
+    // The counter must be visible: B's increment IdLp > A's delete IdLp, so the increment
+    // dominates and the cid is re-registered. The visible value is the counter's preserved
+    // total state — not "reset to zero then incremented":
+    //
+    //   pre-delete:        1.0 (A's increment)
+    //   after delete:      1.0 (no state change to the counter container itself)
+    //   after B's +100.0:  101.0
+    let revision = &va["state"]["revision"];
+    assert_eq!(
+        revision,
+        &json!(101.0),
+        "increment past tombstone reattaches the cid; state is preserved (not reset)"
+    );
+}
