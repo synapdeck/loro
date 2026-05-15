@@ -4,7 +4,7 @@
 mod common;
 use common::doc;
 
-use loro_internal::HandlerTrait;
+use loro_internal::{HandlerTrait, IdLp};
 
 /// `DocState::mergeable_first_op_idlp` returns the IdLp of the first op
 /// applied to a mergeable container, or `None` if no ops exist yet. Used
@@ -99,6 +99,108 @@ fn mergeable_max_op_idlp_lookup() {
         second > first,
         "max IdLp must advance with each op: first={first:?}, second={second:?}"
     );
+}
+
+
+/// `MapState::set_mergeable_tombstone` is monotonic-max: a later (higher) IdLp
+/// replaces an earlier one, but an earlier (lower) IdLp never overwrites a later
+/// one. This matches the LWW semantic for deletes across concurrent peers and is
+/// relied on by the snapshot recovery + apply_local_op + apply_diff hooks that
+/// all funnel through this helper.
+#[test]
+fn set_mergeable_tombstone_is_monotonic_max() {
+    let doc = doc(1);
+    let root = doc.get_map("state");
+
+    let key = "k";
+    let earlier = IdLp::new(1, 10);
+    let later = IdLp::new(1, 20);
+
+    // Apply the earlier tombstone first.
+    root.with_state(|state| {
+        state
+            .as_map_state_mut()
+            .unwrap()
+            .set_mergeable_tombstone(key.into(), earlier);
+        Ok(())
+    })
+    .unwrap();
+    let stored = root
+        .with_state(|state| {
+            Ok(state
+                .as_map_state()
+                .unwrap()
+                .mergeable_tombstone(&key.into()))
+        })
+        .unwrap()
+        .expect("tombstone must be set after first call");
+    assert_eq!(stored, earlier);
+
+    // Apply the LATER tombstone: must replace.
+    root.with_state(|state| {
+        state
+            .as_map_state_mut()
+            .unwrap()
+            .set_mergeable_tombstone(key.into(), later);
+        Ok(())
+    })
+    .unwrap();
+    let stored = root
+        .with_state(|state| {
+            Ok(state
+                .as_map_state()
+                .unwrap()
+                .mergeable_tombstone(&key.into()))
+        })
+        .unwrap()
+        .expect("tombstone must still be set after monotonic-max replacement");
+    assert_eq!(
+        stored, later,
+        "a later tombstone must replace an earlier one"
+    );
+
+    // Apply the EARLIER tombstone again: must NOT regress.
+    root.with_state(|state| {
+        state
+            .as_map_state_mut()
+            .unwrap()
+            .set_mergeable_tombstone(key.into(), earlier);
+        Ok(())
+    })
+    .unwrap();
+    let stored = root
+        .with_state(|state| {
+            Ok(state
+                .as_map_state()
+                .unwrap()
+                .mergeable_tombstone(&key.into()))
+        })
+        .unwrap()
+        .expect("tombstone must still be set");
+    assert_eq!(
+        stored, later,
+        "an earlier tombstone must NOT overwrite a later one (monotonic-max)"
+    );
+
+    // Re-applying the SAME (later) idlp must be a no-op.
+    root.with_state(|state| {
+        state
+            .as_map_state_mut()
+            .unwrap()
+            .set_mergeable_tombstone(key.into(), later);
+        Ok(())
+    })
+    .unwrap();
+    let stored = root
+        .with_state(|state| {
+            Ok(state
+                .as_map_state()
+                .unwrap()
+                .mergeable_tombstone(&key.into()))
+        })
+        .unwrap()
+        .expect("tombstone must still be set");
+    assert_eq!(stored, later, "re-applying the same idlp must be a no-op");
 }
 
 
