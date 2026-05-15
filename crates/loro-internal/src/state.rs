@@ -588,6 +588,20 @@ impl DocState {
             .filter(|id| id.is_mergeable())
             .collect();
 
+        // Capture parent map idxs appearing in the ORIGINAL diff batch before the main loop
+        // mutates/replaces `diff.diff`. The post-loop tombstone reconciliation uses these to
+        // handle remote parent deletes whose diff contains only the parent `MapSet` tombstone,
+        // not the child cid.
+        let map_parent_idxs: FxHashSet<ContainerIdx> = diffs
+            .iter()
+            .filter(|d| {
+                self.store
+                    .get_container(d.idx)
+                    .is_some_and(|s| s.as_map_state().is_some())
+            })
+            .map(|d| d.idx)
+            .collect();
+
         // We need to ensure diff is processed in order
         diffs.sort_by_cached_key(|diff| self.arena.get_depth(diff.idx));
         let mut to_revive_in_next_layer: FxHashSet<ContainerIdx> = FxHashSet::default();
@@ -750,6 +764,12 @@ impl DocState {
         if !mergeable_to_register.is_empty() {
             self.register_mergeable_children(oplog, mergeable_to_register);
         }
+
+        // Reconcile tombstones recorded during this batch against pre-existing
+        // side-table entries. Handles remote parent deletes that arrive without
+        // the child cid in the diff batch, so the registration gate above never
+        // sees the stale side-table entry.
+        self.reconcile_mergeable_tombstones_for(oplog, &map_parent_idxs);
 
         if self.is_recording() {
             self.record_diff(diff)
@@ -1079,6 +1099,88 @@ impl DocState {
                 }
             }
         }
+    }
+
+    /// Walk selected map states' tombstones and evict any side-table cid whose
+    /// `max_op_idlp <= tombstone`. This is deliberately per-cid, not per-key:
+    /// when multiple mergeable cids temporarily share a key with mixed
+    /// reachability, a bulk key eviction would incorrectly remove reachable
+    /// children.
+    ///
+    /// Called from `apply_diff` post-loop to handle remote parent deletes that
+    /// arrive without the child cid in the diff batch. Lock-order: caller acquires `oplog`
+    /// before the state lock and passes `&OpLog` in.
+    pub(crate) fn reconcile_mergeable_tombstones_for(
+        &mut self,
+        oplog: &OpLog,
+        map_parent_idxs: &FxHashSet<ContainerIdx>,
+    ) {
+        let mut eviction_decisions: Vec<(ContainerIdx, ContainerID)> = Vec::new();
+
+        for parent_idx in map_parent_idxs {
+            let tombstones: Vec<(InternalString, IdLp)> = self
+                .store
+                .get_container(*parent_idx)
+                .and_then(|state| state.as_map_state())
+                .map(|map_state| {
+                    map_state
+                        .iter_mergeable_tombstones()
+                        .map(|(key, tombstone)| (key.clone(), *tombstone))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            for (key, tombstone) in tombstones {
+                let registered_cids = self
+                    .store
+                    .get_container(*parent_idx)
+                    .and_then(|state| state.as_map_state())
+                    .map(|map_state| map_state.mergeable_child_ids_for_key(&key))
+                    .unwrap_or_default();
+
+                for cid in registered_cids {
+                    let dominated = match self.mergeable_max_op_idlp(oplog, &cid) {
+                        Some(max_idlp) => max_idlp <= tombstone,
+                        None => true,
+                    };
+                    if dominated {
+                        eviction_decisions.push((*parent_idx, cid));
+                    }
+                }
+            }
+        }
+
+        let did_evict = !eviction_decisions.is_empty();
+        for (parent_idx, cid) in eviction_decisions {
+            if let Some(state) = self.store.get_container_mut(parent_idx) {
+                if let Some(map_state) = state.as_map_state_mut() {
+                    map_state.evict_mergeable_child_cid(&cid);
+                }
+            }
+        }
+
+        if did_evict {
+            self.dead_containers_cache.clear_alive();
+        }
+    }
+
+    /// Walk every map state in the doc and reconcile its mergeable tombstones. Convenience
+    /// wrapper around [`Self::reconcile_mergeable_tombstones_for`] for callers that don't have
+    /// a precomputed parent-idx set; production code uses the per-batch variant from the
+    /// `apply_diff` post-loop and only this wrapper is exposed for tests that exercise the
+    /// reconciliation pass directly.
+    #[doc(hidden)]
+    pub fn reconcile_mergeable_tombstones(&mut self, oplog: &OpLog) {
+        let candidates: Vec<ContainerID> = self.store.iter_all_container_ids().collect();
+        let map_idxs: FxHashSet<ContainerIdx> = candidates
+            .into_iter()
+            .filter_map(|id| {
+                let idx = self.arena.id_to_idx(&id)?;
+                let state = self.store.get_container(idx)?;
+                state.as_map_state().map(|_| idx)
+            })
+            .collect();
+        self.reconcile_mergeable_tombstones_for(oplog, &map_idxs);
     }
 
     /// Return the IdLp of the first applied op against the given mergeable

@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use loro_internal::{
     cursor::PosType, event::Index, handler::ValueOrHandler, loro::ExportMode, ContainerType,
-    HandlerTrait, LoroDoc, ToJson,
+    HandlerTrait, IdLp, LoroDoc, ToJson,
 };
 use serde_json::json;
 
@@ -1447,5 +1447,225 @@ fn local_post_tombstone_mutation_resurrects_cid() {
         doc.get_deep_value().to_json_value(),
         json!({ "state": { "revision": 13.0 } }),
         "post-tombstone local increment must resurrect cid; value is 3.0 + 10.0 = 13.0 (state preserved)"
+    );
+}
+
+/// Peer B has a mergeable counter registered and visible. Peer A deletes
+/// the same key with a higher IdLp. After sync, B's deep value must hide
+/// the counter — the remote delete propagates as a tombstone and the
+/// post-loop reconciliation evicts the side-table entry.
+#[test]
+#[cfg(feature = "counter")]
+fn remote_delete_evicts_registered_mergeable_child_on_receiver() {
+    let a = doc(1);
+    let b = doc(2);
+
+    // B creates and increments the counter, syncs to A.
+    let b_root = b.get_map("state");
+    let b_counter = b_root.get_mergeable_counter("revision").unwrap();
+    b_counter.increment(1.0).unwrap();
+    b.commit_then_renew();
+    sync(&a, &b);
+    assert_eq!(
+        b.get_deep_value().to_json_value(),
+        json!({ "state": { "revision": 1.0 } })
+    );
+
+    // A advances its clock past B's counter op, then deletes.
+    let a_root = a.get_map("state");
+    for i in 0..5 {
+        a_root.insert(&format!("noise_{i}"), i).unwrap();
+        a.commit_then_renew();
+    }
+    a_root.delete("revision").unwrap();
+    a.commit_then_renew();
+
+    // Sync A's delete to B. B's side-table entry for "revision" must be
+    // evicted because A's tombstone IdLp > B's increment IdLp.
+    sync(&a, &b);
+
+    let vb = b.get_deep_value().to_json_value();
+    assert!(
+        vb["state"].get("revision").is_none(),
+        "remote delete must evict B's side-table entry; got {vb}"
+    );
+}
+
+/// Focused regression for the per-cid reconciliation rule. The side table is
+/// seeded with two cids under the same key: an old dominated counter and a
+/// newer reachable text. Reconciliation must evict only the dominated cid,
+/// not bulk-remove the whole key.
+#[test]
+#[cfg(feature = "counter")]
+fn remote_delete_evicts_only_dominated_cid_under_mixed_reachability() {
+    let doc = doc(1);
+    let root = doc.get_map("state");
+    let key = "revision";
+
+    let counter = root.get_mergeable_counter(key).unwrap();
+    counter.increment(1.0).unwrap();
+    doc.commit_then_renew();
+    let counter_cid = counter.id();
+
+    // Remove the counter side-table entry so we can create a competing text
+    // cid under the same key through the public mergeable getter.
+    root.with_state(|state| {
+        state
+            .as_map_state_mut()
+            .unwrap()
+            .evict_mergeable_child_cid(&counter_cid);
+        Ok(())
+    })
+    .unwrap();
+
+    let text = root.get_mergeable_text(key).unwrap();
+    text.insert(0, "reachable", PosType::Unicode).unwrap();
+    doc.commit_then_renew();
+    let text_cid = text.id();
+
+    let tombstone = IdLp::new(1, 0);
+    {
+        let oplog = doc.oplog().lock();
+        let state = doc.app_state().lock();
+        let counter_max = state
+            .mergeable_max_op_idlp(&oplog, &counter_cid)
+            .expect("counter must have an op");
+        let text_max = state
+            .mergeable_max_op_idlp(&oplog, &text_cid)
+            .expect("text must have an op");
+        assert!(
+            counter_max <= tombstone,
+            "test precondition: counter should be dominated ({counter_max:?} <= {tombstone:?})"
+        );
+        assert!(
+            text_max > tombstone,
+            "test precondition: text should remain reachable ({text_max:?} > {tombstone:?})"
+        );
+    }
+
+    // Seed the mixed side-table state directly: both cids under one key plus a
+    // tombstone that dominates only the counter.
+    root.with_state(|state| {
+        let map = state.as_map_state_mut().unwrap();
+        map.register_mergeable_child(key.into(), counter_cid.clone());
+        map.register_mergeable_child(key.into(), text_cid.clone());
+        map.set_mergeable_tombstone(key.into(), tombstone);
+        Ok(())
+    })
+    .unwrap();
+
+    let before = root
+        .with_state(|state| {
+            Ok(state
+                .as_map_state()
+                .unwrap()
+                .mergeable_child_ids_for_key(&key.into()))
+        })
+        .unwrap();
+    assert!(before.contains(&counter_cid));
+    assert!(before.contains(&text_cid));
+
+    {
+        let oplog_g = doc.oplog().lock();
+        let mut app_state = doc.app_state().lock();
+        app_state.reconcile_mergeable_tombstones(&oplog_g);
+    }
+
+    let after = root
+        .with_state(|state| {
+            Ok(state
+                .as_map_state()
+                .unwrap()
+                .mergeable_child_ids_for_key(&key.into()))
+        })
+        .unwrap();
+    assert!(
+        !after.contains(&counter_cid),
+        "dominated counter cid must be evicted; got {after:?}"
+    );
+    assert!(
+        after.contains(&text_cid),
+        "reachable text cid must survive per-cid reconciliation; got {after:?}"
+    );
+}
+
+/// Three-peer smoke check: a remote delete tombstone should evict stale
+/// side-table entries on receivers, allowing a later competing-kind mergeable
+/// child with post-tombstone ops to become visible and converge.
+#[test]
+#[cfg(feature = "counter")]
+fn three_peer_delete_resurrect_with_competing_kinds() {
+    let a = doc(1);
+    let b = doc(2);
+    let c = doc(3);
+
+    let b_root = b.get_map("state");
+    let b_counter = b_root.get_mergeable_counter("revision").unwrap();
+    b_counter.increment(1.0).unwrap();
+    b.commit_then_renew();
+
+    sync(&a, &b);
+    sync(&b, &c);
+    assert_eq!(
+        c.get_deep_value().to_json_value(),
+        json!({ "state": { "revision": 1.0 } })
+    );
+
+    let a_root = a.get_map("state");
+    for i in 0..6 {
+        a_root.insert(&format!("noise_{i}"), i).unwrap();
+        a.commit_then_renew();
+    }
+    a_root.delete("revision").unwrap();
+    a.commit_then_renew();
+
+    sync(&a, &b);
+    sync(&a, &c);
+    assert!(
+        b.get_deep_value().to_json_value()["state"]
+            .get("revision")
+            .is_none(),
+        "B must hide the stale counter after importing A's delete"
+    );
+    assert!(
+        c.get_deep_value().to_json_value()["state"]
+            .get("revision")
+            .is_none(),
+        "C must hide the stale counter after importing A's delete"
+    );
+
+    let c_text = c.get_map("state").get_mergeable_text("revision").unwrap();
+    c_text.insert(0, "after-delete", PosType::Unicode).unwrap();
+    c.commit_then_renew();
+
+    sync(&b, &c);
+    sync(&a, &c);
+    sync(&a, &b);
+
+    let expected = json!({
+        "state": {
+            "noise_0": 0,
+            "noise_1": 1,
+            "noise_2": 2,
+            "noise_3": 3,
+            "noise_4": 4,
+            "noise_5": 5,
+            "revision": "after-delete",
+        }
+    });
+    assert_eq!(
+        a.get_deep_value().to_json_value(),
+        expected,
+        "A must converge"
+    );
+    assert_eq!(
+        b.get_deep_value().to_json_value(),
+        expected,
+        "B must converge"
+    );
+    assert_eq!(
+        c.get_deep_value().to_json_value(),
+        expected,
+        "C must converge"
     );
 }

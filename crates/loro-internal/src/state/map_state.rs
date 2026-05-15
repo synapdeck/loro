@@ -303,7 +303,10 @@ impl MapState {
     /// path resolution, reachability, deletion checks, child enumeration)
     /// while leaving `self.map` — and therefore the encoded op stream and the
     /// fast snapshot value — untouched.
-    pub(crate) fn register_mergeable_child(&mut self, key: InternalString, id: ContainerID) {
+    /// Test-visible helper for directly seeding the mergeable side table. This
+    /// is not a stable public API; it is exposed so integration tests can build
+    /// focused reconciliation scenarios without encoding synthetic imports.
+    pub fn register_mergeable_child(&mut self, key: InternalString, id: ContainerID) {
         debug_assert!(
             id.is_mergeable(),
             "register_mergeable_child must only be called with mergeable container ids"
@@ -343,7 +346,9 @@ impl MapState {
     /// Return every mergeable cid currently registered under `key`. Normally
     /// at most one survives after the import-time LWW resolver runs; multiple
     /// can be transiently present mid-resolution.
-    pub(crate) fn mergeable_child_ids_for_key(&self, key: &InternalString) -> Vec<ContainerID> {
+    /// Test-visible helper for inspecting mergeable side-table entries. This is
+    /// not a stable public API.
+    pub fn mergeable_child_ids_for_key(&self, key: &InternalString) -> Vec<ContainerID> {
         self.child_containers
             .iter()
             .filter(|(id, k)| id.is_mergeable() && *k == key)
@@ -371,7 +376,9 @@ impl MapState {
     /// (higher IdLp) replaces an earlier one; an earlier tombstone never
     /// overwrites a later one. This matches the LWW semantic for deletes
     /// across concurrent peers.
-    pub(crate) fn set_mergeable_tombstone(&mut self, key: InternalString, idlp: IdLp) {
+    /// Test-visible helper for directly seeding a mergeable tombstone. This is
+    /// not a stable public API.
+    pub fn set_mergeable_tombstone(&mut self, key: InternalString, idlp: IdLp) {
         let entry = self.mergeable_tombstones.entry(key).or_insert(idlp);
         if idlp > *entry {
             *entry = idlp;
@@ -392,7 +399,7 @@ impl MapState {
     /// The caller decides WHICH cids to evict based on tombstone domination. Eviction is per-cid
     /// rather than per-key because mixed reachable/dominated states under the same key require
     /// keeping the reachable cids while dropping the dominated ones.
-    pub(crate) fn evict_mergeable_child_cid(&mut self, cid: &ContainerID) -> bool {
+    pub fn evict_mergeable_child_cid(&mut self, cid: &ContainerID) -> bool {
         self.child_containers.remove(cid).is_some()
     }
 }
