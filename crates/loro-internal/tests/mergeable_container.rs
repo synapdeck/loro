@@ -1177,3 +1177,48 @@ fn type_mismatch_error_mentions_lww_resolution() {
         "error must hint at LWW/import-time resolution or mergeable context; got {msg}"
     );
 }
+
+/// `DocState::mergeable_max_op_idlp` returns the IdLp of the LATEST op
+/// applied to a mergeable container, or `None` if no ops exist yet. Used
+/// by the tombstone-vs-cid reachability gate: a mergeable cid is reachable
+/// iff `max_op_idlp(cid) > tombstone_idlp(key)`.
+#[test]
+#[cfg(feature = "counter")]
+fn mergeable_max_op_idlp_lookup() {
+    let a = doc(1);
+    let root = a.get_map("state");
+
+    let counter = root.get_mergeable_counter("revision").unwrap();
+    let cid = counter.id();
+
+    // No ops yet -> None.
+    let pre = {
+        let oplog = a.oplog().lock();
+        let state = a.app_state().lock();
+        state.mergeable_max_op_idlp(&oplog, &cid)
+    };
+    assert!(pre.is_none(), "no ops -> None; got {pre:?}");
+
+    counter.increment(1.0).unwrap();
+    a.commit_then_renew();
+    let first = {
+        let oplog = a.oplog().lock();
+        let state = a.app_state().lock();
+        state.mergeable_max_op_idlp(&oplog, &cid)
+    }
+    .expect("after one op, max-op-idlp must exist");
+
+    counter.increment(2.0).unwrap();
+    a.commit_then_renew();
+    let second = {
+        let oplog = a.oplog().lock();
+        let state = a.app_state().lock();
+        state.mergeable_max_op_idlp(&oplog, &cid)
+    }
+    .expect("after two ops, max-op-idlp must exist");
+
+    assert!(
+        second > first,
+        "max IdLp must advance with each op: first={first:?}, second={second:?}"
+    );
+}

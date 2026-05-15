@@ -1018,6 +1018,45 @@ impl DocState {
         best
     }
 
+    /// Return the IdLp of the LATEST applied op against the given mergeable
+    /// container, or `None` if no ops have been applied yet.
+    ///
+    /// "Latest" is determined by total IdLp order (lamport, peer): the op with the largest IdLp
+    /// among all ops on this container is the container's most-recent activity. Used by the
+    /// tombstone-vs-cid reachability gate: a mergeable cid is reachable iff
+    /// `max_op_idlp(cid) > tombstone_idlp(key)`.
+    ///
+    /// Returns `None` for:
+    /// - non-mergeable cids,
+    /// - mergeable cids that are not registered in the arena,
+    /// - mergeable cids registered in the arena but with no applied ops.
+    ///
+    /// Lock-order convention: caller acquires `oplog` before `state` and passes `&OpLog` in. See
+    /// [`Self::mergeable_first_op_idlp`] for the parallel min-side helper.
+    pub fn mergeable_max_op_idlp(&self, oplog: &OpLog, cid: &ContainerID) -> Option<IdLp> {
+        if !cid.is_mergeable() {
+            return None;
+        }
+        let target_idx = self.arena.id_to_idx(cid)?;
+        let mut best: Option<IdLp> = None;
+        oplog.change_store().visit_all_changes(&mut |change| {
+            let base_counter = change.id.counter;
+            let base_lamport = change.lamport;
+            for op in change.ops.iter() {
+                if op.container != target_idx {
+                    continue;
+                }
+                let lamport = base_lamport + (op.counter - base_counter) as crate::change::Lamport;
+                let idlp = IdLp::new(change.id.peer, lamport);
+                best = Some(match best {
+                    Some(cur) if cur >= idlp => cur,
+                    _ => idlp,
+                });
+            }
+        });
+        best
+    }
+
     pub(crate) fn get_value_by_idx(&mut self, container_idx: ContainerIdx) -> LoroValue {
         self.store
             .get_value(container_idx)
