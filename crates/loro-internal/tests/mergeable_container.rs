@@ -340,7 +340,10 @@ fn update_import_populates_mergeable_side_table_on_receiver() {
     let a = doc(1);
     let b = doc(2);
 
-    let a_counter = a.get_map("state").get_mergeable_counter("revision").unwrap();
+    let a_counter = a
+        .get_map("state")
+        .get_mergeable_counter("revision")
+        .unwrap();
     a_counter.increment(5.0).unwrap();
     a.commit_then_renew();
 
@@ -356,7 +359,10 @@ fn update_import_populates_mergeable_side_table_on_receiver() {
 
     // Peer B then locally resolves the mergeable handler — this must return
     // the same cid as the one peer A wrote, and the existing value.
-    let b_counter = b.get_map("state").get_mergeable_counter("revision").unwrap();
+    let b_counter = b
+        .get_map("state")
+        .get_mergeable_counter("revision")
+        .unwrap();
     assert_eq!(b_counter.id(), a_counter.id());
     assert_eq!(b_counter.get_value().to_json_value(), json!(5.0));
 
@@ -380,9 +386,18 @@ fn three_peer_mergeable_counter_convergence() {
     let b = doc(2);
     let c = doc(3);
 
-    let a_counter = a.get_map("state").get_mergeable_counter("revision").unwrap();
-    let b_counter = b.get_map("state").get_mergeable_counter("revision").unwrap();
-    let c_counter = c.get_map("state").get_mergeable_counter("revision").unwrap();
+    let a_counter = a
+        .get_map("state")
+        .get_mergeable_counter("revision")
+        .unwrap();
+    let b_counter = b
+        .get_map("state")
+        .get_mergeable_counter("revision")
+        .unwrap();
+    let c_counter = c
+        .get_map("state")
+        .get_mergeable_counter("revision")
+        .unwrap();
     assert_eq!(a_counter.id(), b_counter.id());
     assert_eq!(b_counter.id(), c_counter.id());
 
@@ -412,8 +427,14 @@ fn post_merge_concurrent_counter_increments_converge() {
     let a = doc(1);
     let b = doc(2);
 
-    let a_counter = a.get_map("state").get_mergeable_counter("revision").unwrap();
-    let b_counter = b.get_map("state").get_mergeable_counter("revision").unwrap();
+    let a_counter = a
+        .get_map("state")
+        .get_mergeable_counter("revision")
+        .unwrap();
+    let b_counter = b
+        .get_map("state")
+        .get_mergeable_counter("revision")
+        .unwrap();
     a_counter.increment(1.0).unwrap();
     b_counter.increment(1.0).unwrap();
     sync(&a, &b);
@@ -441,7 +462,10 @@ fn post_merge_concurrent_counter_increments_converge() {
 #[cfg(feature = "counter")]
 fn empty_mergeable_child_after_snapshot_import() {
     let a = doc(1);
-    let _counter = a.get_map("state").get_mergeable_counter("revision").unwrap();
+    let _counter = a
+        .get_map("state")
+        .get_mergeable_counter("revision")
+        .unwrap();
     // Deliberately no increment. Commit anyway so any pending state is flushed.
     a.commit_then_renew();
 
@@ -458,7 +482,10 @@ fn empty_mergeable_child_after_snapshot_import() {
         "unmutated mergeable child must not appear in deep value after snapshot import",
     );
 
-    let b_counter = b.get_map("state").get_mergeable_counter("revision").unwrap();
+    let b_counter = b
+        .get_map("state")
+        .get_mergeable_counter("revision")
+        .unwrap();
     assert_eq!(b_counter.id(), _counter.id(), "cid still deterministic");
     assert_eq!(b_counter.get_value().to_json_value(), json!(0.0));
 }
@@ -514,11 +541,17 @@ fn snapshot_import_different_type_collision_is_observable() {
     let b_map = b.get_map("state").get_mergeable_map("k").unwrap();
     b_map.insert("flag", true).unwrap();
     b.commit_then_renew();
-    assert_ne!(a_text.id(), b_map.id(),
-        "different kinds under the same key MUST produce different cids");
+    assert_ne!(
+        a_text.id(),
+        b_map.id(),
+        "different kinds under the same key MUST produce different cids"
+    );
 
     let result = b.import(&snapshot);
-    assert!(result.is_ok(), "import itself must not fail; got {result:?}");
+    assert!(
+        result.is_ok(),
+        "import itself must not fail; got {result:?}"
+    );
 
     // After LWW at import, exactly one kind survives; the other errors with kind-mismatch.
     let text_result = b.get_map("state").get_mergeable_text("k");
@@ -548,16 +581,20 @@ fn parse_mergeable_rejects_malformed_payloads() {
         name: "🤝:zzzz".into(),
         container_type: ContainerType::Counter,
     };
-    assert!(bad_hex.parse_mergeable().is_none(),
-        "non-hex chars in payload must reject");
+    assert!(
+        bad_hex.parse_mergeable().is_none(),
+        "non-hex chars in payload must reject"
+    );
 
     // Mergeable prefix, valid hex, but truncated (no segments).
     let truncated = ContainerID::Root {
         name: "🤝:".into(),
         container_type: ContainerType::Counter,
     };
-    assert!(truncated.parse_mergeable().is_none(),
-        "empty payload must reject");
+    assert!(
+        truncated.parse_mergeable().is_none(),
+        "empty payload must reject"
+    );
 
     // Mergeable prefix, valid hex, but trailing garbage after the type byte.
     let parent = ContainerID::new_root("state", ContainerType::Map);
@@ -571,17 +608,24 @@ fn parse_mergeable_rejects_malformed_payloads() {
         name: name.into(),
         container_type: ContainerType::Counter,
     };
-    assert!(with_garbage.parse_mergeable().is_none(),
-        "trailing bytes after type byte must reject");
+    assert!(
+        with_garbage.parse_mergeable().is_none(),
+        "trailing bytes after type byte must reject"
+    );
 
     // Mergeable prefix and a payload that decodes correctly, BUT the
     // encoded type byte disagrees with the Root's container_type field.
     let mismatched = ContainerID::Root {
-        name: match &cid { ContainerID::Root { name, .. } => name.clone(), _ => unreachable!() },
+        name: match &cid {
+            ContainerID::Root { name, .. } => name.clone(),
+            _ => unreachable!(),
+        },
         container_type: ContainerType::Map, // payload says Counter
     };
-    assert!(mismatched.parse_mergeable().is_none(),
-        "type-byte mismatch with Root.container_type must reject");
+    assert!(
+        mismatched.parse_mergeable().is_none(),
+        "type-byte mismatch with Root.container_type must reject"
+    );
 }
 
 /// `LoroDoc::get_map` must reject names in the mergeable namespace at the
@@ -725,7 +769,10 @@ fn type_mismatch_rejected_after_snapshot_registers_the_key() {
 #[cfg(feature = "counter")]
 fn mergeable_child_subscription_receives_own_events() {
     let doc = doc(1);
-    let counter = doc.get_map("state").get_mergeable_counter("revision").unwrap();
+    let counter = doc
+        .get_map("state")
+        .get_mergeable_counter("revision")
+        .unwrap();
 
     let count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
     let count_clone = count.clone();
@@ -761,7 +808,9 @@ fn detached_map_get_mergeable_counter_falls_back_cleanly() {
     let counter = detached
         .get_mergeable_counter("revision")
         .expect("detached fallback must succeed");
-    counter.increment(7.0).expect("detached counter must be mutable");
+    counter
+        .increment(7.0)
+        .expect("detached counter must be mutable");
     // The detached handler still surfaces the value through its local state.
     assert_eq!(counter.get_value().to_json_value(), json!(7.0));
 }
@@ -804,13 +853,20 @@ fn mergeable_cid_roundtrips_for_degenerate_keys() {
 #[cfg(feature = "counter")]
 fn shallow_snapshot_roundtrip_preserves_mergeable_child() {
     let a = doc(1);
-    let counter = a.get_map("state").get_mergeable_counter("revision").unwrap();
+    let counter = a
+        .get_map("state")
+        .get_mergeable_counter("revision")
+        .unwrap();
     counter.increment(4.0).unwrap();
     a.commit_then_renew();
 
     // ShallowSnapshot at current frontiers.
     let frontiers = a.state_frontiers();
-    let snapshot = a.export(ExportMode::ShallowSnapshot(std::borrow::Cow::Owned(frontiers))).unwrap();
+    let snapshot = a
+        .export(ExportMode::ShallowSnapshot(std::borrow::Cow::Owned(
+            frontiers,
+        )))
+        .unwrap();
 
     let b = doc(2);
     b.import(&snapshot).unwrap();
@@ -830,7 +886,10 @@ fn undo_manager_reverts_mergeable_counter_mutation() {
     use loro_internal::UndoManager;
 
     let doc = doc(1);
-    let counter = doc.get_map("state").get_mergeable_counter("revision").unwrap();
+    let counter = doc
+        .get_map("state")
+        .get_mergeable_counter("revision")
+        .unwrap();
     let undo = UndoManager::new(&doc);
 
     counter.increment(5.0).unwrap();
@@ -842,8 +901,11 @@ fn undo_manager_reverts_mergeable_counter_mutation() {
 
     // The mergeable child still exists (registration is not an op), but its
     // value is back to zero.
-    assert_eq!(counter.get_value().to_json_value(), json!(0.0),
-        "undo must revert the increment");
+    assert_eq!(
+        counter.get_value().to_json_value(),
+        json!(0.0),
+        "undo must revert the increment"
+    );
 }
 
 /// Calling `MapHandler::delete(key)` on a key that has a mergeable child
@@ -897,8 +959,7 @@ fn has_container_reports_false_for_unwritten_mergeable_child() {
     // Build the deterministic mergeable cid by hand, WITHOUT calling
     // get_mergeable_counter (which would register the side-table entry).
     let parent_id = root.id();
-    let unwritten_cid =
-        ContainerID::new_mergeable(&parent_id, "revision", ContainerType::Counter);
+    let unwritten_cid = ContainerID::new_mergeable(&parent_id, "revision", ContainerType::Counter);
     assert!(unwritten_cid.is_mergeable());
     assert!(
         !doc.has_container(&unwritten_cid),
@@ -1220,5 +1281,50 @@ fn mergeable_max_op_idlp_lookup() {
     assert!(
         second > first,
         "max IdLp must advance with each op: first={first:?}, second={second:?}"
+    );
+}
+
+/// Calling `MapHandler::delete(key)` on a key with a mergeable child
+/// records a tombstone in the parent MapState. The tombstone's IdLp
+/// matches the delete op's IdLp (peer, lamport).
+#[test]
+#[cfg(feature = "counter")]
+fn delete_on_mergeable_key_records_tombstone() {
+    let doc = doc(1);
+    let root = doc.get_map("state");
+    let counter = root.get_mergeable_counter("revision").unwrap();
+    counter.increment(1.0).unwrap();
+    doc.commit_then_renew();
+
+    // Read parent MapState; tombstone for "revision" should be None.
+    let before = root
+        .with_state(|state| {
+            Ok(state
+                .as_map_state()
+                .unwrap()
+                .mergeable_tombstone(&"revision".into()))
+        })
+        .unwrap();
+    assert!(
+        before.is_none(),
+        "no tombstone before delete; got {before:?}"
+    );
+
+    root.delete("revision").unwrap();
+    doc.commit_then_renew();
+
+    let after = root
+        .with_state(|state| {
+            Ok(state
+                .as_map_state()
+                .unwrap()
+                .mergeable_tombstone(&"revision".into()))
+        })
+        .unwrap()
+        .expect("tombstone must exist after delete on mergeable key");
+    assert_eq!(after.peer, 1, "tombstone peer must be the local peer");
+    assert!(
+        after.lamport > 0,
+        "tombstone lamport must be > 0 after a delete"
     );
 }

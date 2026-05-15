@@ -80,6 +80,14 @@ impl ContainerState for MapState {
             }
 
             if changed {
+                // Record tombstones for value-clearing MapSets that win the map
+                // LWW comparison. Keeping this inside `changed` avoids seeding
+                // tombstones from stale incoming deletes that lost to newer map
+                // values.
+                if value.value.is_none() {
+                    self.set_mergeable_tombstone(key.clone(), IdLp::new(value.peer, value.lamp));
+                }
+
                 resolved_delta = resolved_delta.with_entry(
                     key,
                     ResolvedMapValue {
@@ -117,6 +125,20 @@ impl ContainerState for MapState {
                 }) = prev
                 {
                     ans.deleted_containers.push(c);
+                }
+
+                // If this is a value-clearing op (delete), unconditionally record a tombstone at
+                // this op's IdLp. Tombstones are consulted by the mergeable-registration gate;
+                // recording for non-mergeable keys is harmless (no mergeable child will ever
+                // register under such a key).
+                //
+                // Recording ALL `None` entries (not just those where a mergeable child is
+                // currently registered) handles the case where a fresh receiver imports a parent
+                // delete before the child cid has been registered locally. Without this, the
+                // receiver would miss the tombstone and later silently re-register the cid.
+                if value.is_none() {
+                    let idlp = IdLp::new(op.id.peer, op.lamport);
+                    self.set_mergeable_tombstone(key.clone(), idlp);
                 }
             }
             _ => unreachable!(),
@@ -341,7 +363,7 @@ impl MapState {
     }
 
     /// Return the tombstone IdLp for the given key, if any.
-    pub(crate) fn mergeable_tombstone(&self, key: &InternalString) -> Option<IdLp> {
+    pub fn mergeable_tombstone(&self, key: &InternalString) -> Option<IdLp> {
         self.mergeable_tombstones.get(key).copied()
     }
 
