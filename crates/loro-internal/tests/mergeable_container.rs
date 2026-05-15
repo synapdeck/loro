@@ -1885,3 +1885,29 @@ fn snapshot_recovery_seeds_tombstone_even_without_existing_child() {
          child registration; without the fix, B shows the resurrected counter"
     );
 }
+
+/// The op stream emitted by `delete` on a mergeable key contains exactly
+/// one op (a regular MapSet tombstone) by the local peer. No new op
+/// types are introduced. Older peers receiving this stream apply it as
+/// a regular tombstone (no-op against the value table because they
+/// never had a value entry for the mergeable child).
+#[test]
+#[cfg(feature = "counter")]
+fn delete_on_mergeable_key_emits_only_existing_op_types() {
+    let doc = doc(1);
+    let root = doc.get_map("state");
+    let counter = root.get_mergeable_counter("revision").unwrap();
+    counter.increment(1.0).unwrap();
+    doc.commit_then_renew();
+    let counter_before = doc.oplog_vv().get(&1).copied().unwrap_or(0);
+
+    root.delete("revision").unwrap();
+    doc.commit_then_renew();
+    let counter_after = doc.oplog_vv().get(&1).copied().unwrap_or(0);
+
+    let new_ops = counter_after - counter_before;
+    assert_eq!(
+        new_ops, 1,
+        "delete must emit exactly one op (the MapSet tombstone); got {new_ops}"
+    );
+}
