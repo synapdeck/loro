@@ -1416,3 +1416,36 @@ fn get_mergeable_after_delete_does_not_resurrect() {
         "handler reads preserved KV state"
     );
 }
+
+/// After local `delete`, a local mutation on the same mergeable child
+/// (via the handler returned from a post-delete `get_mergeable_*`)
+/// must re-register the cid in the parent's side table. Deep value
+/// shows the counter again, with the preserved prior value plus the
+/// new increment.
+#[test]
+#[cfg(feature = "counter")]
+fn local_post_tombstone_mutation_resurrects_cid() {
+    let doc = doc(1);
+    let root = doc.get_map("state");
+    let counter = root.get_mergeable_counter("revision").unwrap();
+    counter.increment(3.0).unwrap();
+    doc.commit_then_renew();
+
+    root.delete("revision").unwrap();
+    doc.commit_then_renew();
+    assert_eq!(doc.get_deep_value().to_json_value(), json!({ "state": {} }));
+
+    // Re-get returns a handler but does not resurrect the cid on its own.
+    let counter2 = root.get_mergeable_counter("revision").unwrap();
+
+    // Local increment: this op's IdLp will be > tombstone (clock advanced
+    // by the delete itself plus this commit). Should resurrect.
+    counter2.increment(10.0).unwrap();
+    doc.commit_then_renew();
+
+    assert_eq!(
+        doc.get_deep_value().to_json_value(),
+        json!({ "state": { "revision": 13.0 } }),
+        "post-tombstone local increment must resurrect cid; value is 3.0 + 10.0 = 13.0 (state preserved)"
+    );
+}

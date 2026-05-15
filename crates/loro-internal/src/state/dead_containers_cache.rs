@@ -1,5 +1,6 @@
 use super::{ContainerState, DocState};
 use crate::container::idx::ContainerIdx;
+use crate::InternalString;
 use rustc_hash::FxHashMap;
 
 #[derive(Default, Debug, Clone)]
@@ -32,18 +33,39 @@ impl DocState {
         let is_deleted = loop {
             let id = self.arena.idx_to_id(idx).unwrap();
             if let Some(parent_idx) = self.arena.get_parent(idx) {
+                let parent_id = self.arena.idx_to_id(parent_idx).unwrap();
                 let Some(parent_state) = self.store.get_container_mut(parent_idx) else {
                     break true;
                 };
                 if !parent_state.contains_child(&id) {
-                    break true;
+                    // A mergeable child can be absent from `child_containers` while its KV
+                    // state remains in the store: a `delete` evicts the side-table entry but
+                    // preserves the underlying container so that a future post-tombstone op
+                    // can resurrect it. Treat that detached-but-preserved case as not deleted
+                    // (the handler stays usable for reads); any other "parent has no record
+                    // of this child" case is a real deletion.
+                    let is_tombstoned_mergeable_child = id
+                        .parse_mergeable()
+                        .filter(|(expected_parent, _, _)| expected_parent == &parent_id)
+                        .is_some_and(|(_, key, _)| {
+                            let key: InternalString = key.into();
+                            parent_state
+                                .as_map_state()
+                                .and_then(|map_state| map_state.mergeable_tombstone(&key))
+                                .is_some()
+                        });
+
+                    if !is_tombstoned_mergeable_child {
+                        break true;
+                    }
                 }
 
                 idx = parent_idx;
                 visited.push(idx);
             } else {
-                // Top-level (non-mergeable) Roots are always alive; everything else that walked
-                // all the way up without finding a parent is treated as deleted.
+                // No parent in the arena: top-level Roots are always alive; anything else
+                // (including a mergeable Root whose parent edge was never wired) is treated
+                // as deleted.
                 break !id.is_root() || id.is_mergeable();
             }
         };

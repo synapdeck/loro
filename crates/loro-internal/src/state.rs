@@ -821,6 +821,49 @@ impl DocState {
             }
         }
 
+        // If this op targets a mergeable child container AND its parent has a
+        // tombstone for this child's key AND the op's IdLp > tombstone,
+        // re-register the cid in the parent's side table. This is the local
+        // analog to the remote register_mergeable_children path; it allows
+        // post-tombstone local mutations to resurrect the cid without requiring
+        // a round-trip through apply_diff.
+        //
+        // Gate on `tombstone.is_some()` to avoid double-registering in the
+        // no-tombstone case, where handler.rs::get_mergeable_container has
+        // already done the registration at handler-creation time.
+        if let Some(cid) = self.arena.idx_to_id(op.container) {
+            if cid.is_mergeable() {
+                if let Some((parent_id, key, _kind)) = cid.parse_mergeable() {
+                    let key_istr: InternalString = key.into();
+                    let parent_idx = self.arena.register_container(&parent_id);
+
+                    // Read pass: look up the parent's tombstone.
+                    let tombstone: Option<IdLp> = self
+                        .store
+                        .get_container_mut(parent_idx)
+                        .and_then(|state| state.as_map_state())
+                        .and_then(|map_state| map_state.mergeable_tombstone(&key_istr));
+
+                    // Use the canonical RawOp helper rather than composing an
+                    // IdLp by hand.
+                    let op_idlp = raw_op.idlp();
+
+                    // Gate ONLY when a tombstone exists. With no tombstone there is no double-
+                    // registration risk because `handler.rs::get_mergeable_container` has already
+                    // (un)registered at handler-creation time.
+                    let should_register = matches!(tombstone, Some(t) if op_idlp > t);
+
+                    if should_register {
+                        if let Some(state) = self.store.get_container_mut(parent_idx) {
+                            if let Some(map_state) = state.as_map_state_mut() {
+                                map_state.register_mergeable_child(key_istr, cid.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
