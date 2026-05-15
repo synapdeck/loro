@@ -1763,3 +1763,104 @@ fn concurrent_delete_wins_against_earlier_increment() {
         "delete with higher IdLp must dominate; got {va}"
     );
 }
+
+/// Snapshot round-trip preserves the delete semantic. A peer creates and
+/// deletes a mergeable counter, exports a snapshot; the receiving peer
+/// imports and sees no counter in deep value — the tombstone was
+/// recovered from the parent map's existing value table.
+#[test]
+#[cfg(feature = "counter")]
+fn snapshot_roundtrip_preserves_delete_via_tombstone_recovery() {
+    let a = doc(1);
+    let a_root = a.get_map("state");
+    let a_counter = a_root.get_mergeable_counter("revision").unwrap();
+    a_counter.increment(5.0).unwrap();
+    a_root.delete("revision").unwrap();
+    a.commit_then_renew();
+    assert_eq!(a.get_deep_value().to_json_value(), json!({ "state": {} }));
+
+    let snapshot = a.export(ExportMode::Snapshot).unwrap();
+    let b = doc(2);
+    b.import(&snapshot).unwrap();
+
+    assert_eq!(
+        b.get_deep_value().to_json_value(),
+        json!({ "state": {} }),
+        "snapshot import must recover the tombstone via MapState.map's None entry"
+    );
+
+    let b_root = b.get_map("state");
+    let tombstone = b_root
+        .with_state(|state| {
+            Ok(state
+                .as_map_state()
+                .unwrap()
+                .mergeable_tombstone(&"revision".into()))
+        })
+        .unwrap();
+    assert!(
+        tombstone.is_some(),
+        "tombstone must be recovered on the receiving peer; got None"
+    );
+}
+
+/// Fresh-receiver case: the snapshot has a tombstone for "k" but NO mergeable
+/// cid under "k" — because the deleting peer never created the mergeable
+/// child (peer C, who did create it concurrently, hasn't synced yet). When
+/// C's update later arrives, the gate must reject the registration because
+/// the tombstone was seeded from `MapValue { value: None }` even though no
+/// mergeable cid existed at snapshot-import time.
+///
+/// If recovery only seeded tombstones for keys that already had a mergeable
+/// cid, this test fails: B's gate sees no tombstone, allows the registration,
+/// and B's deep value shows the counter that the snapshot already declared
+/// dead.
+#[test]
+#[cfg(feature = "counter")]
+fn snapshot_recovery_seeds_tombstone_even_without_existing_child() {
+    let a = doc(1);
+    let a_root = a.get_map("state");
+    a_root.insert("k", 42).unwrap();
+    a_root.delete("k").unwrap();
+    a.commit_then_renew();
+
+    let snapshot = a.export(ExportMode::Snapshot).unwrap();
+    let b = doc(2);
+    b.import(&snapshot).unwrap();
+
+    let b_root = b.get_map("state");
+    let tombstone_b = b_root
+        .with_state(|state| {
+            Ok(state
+                .as_map_state()
+                .unwrap()
+                .mergeable_tombstone(&"k".into()))
+        })
+        .unwrap();
+    assert!(
+        tombstone_b.is_some(),
+        "tombstone for 'k' must be recovered even though no mergeable cid \
+         exists under that key in the snapshot; got None"
+    );
+
+    let c = doc(3);
+    let c_root = c.get_map("state");
+    let _c_counter = c_root.get_mergeable_counter("k").unwrap();
+    let c_counter = c.get_map("state").get_mergeable_counter("k").unwrap();
+    c_counter.increment(7.0).unwrap();
+    c.commit_then_renew();
+
+    let c_updates = c
+        .export(ExportMode::Updates {
+            from: Default::default(),
+        })
+        .unwrap();
+    b.import(&c_updates).unwrap();
+
+    assert_eq!(
+        b.get_deep_value().to_json_value(),
+        json!({ "state": {} }),
+        "tombstone seeded from MapValue None must gate the later remote \
+         child registration; without the fix, B shows the resurrected counter"
+    );
+}

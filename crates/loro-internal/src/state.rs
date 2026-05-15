@@ -950,8 +950,8 @@ impl DocState {
         ans
     }
 
-    /// Walk all known containers and, for each mergeable child container,
-    /// register it under its parent MapState's `child_containers` side table.
+    /// Walk all known containers and recover mergeable side tables that are not
+    /// serialized in snapshots.
     ///
     /// Mergeable children are stored in KV like any other container (they have
     /// their own state), so they survive snapshot round-trip at the container
@@ -966,8 +966,59 @@ impl DocState {
     /// reachability checks see mergeable children without requiring the caller
     /// to re-invoke `get_mergeable_*` on every nested key.
     fn repopulate_mergeable_child_side_tables(&mut self, oplog: &OpLog) {
-        // Collect all mergeable cids first so we don't hold an iterator borrow
-        // while mutating MapStates below.
+        // Pass 1: collect ALL map cids in the store. Iterating all map states
+        // (not just parents of mergeable children) is required for the
+        // fresh-receiver case where the snapshot has a tombstone for a key that
+        // this peer has never seen a mergeable child under. A later remote diff
+        // carrying a child-creation op from a third peer must be gated by that
+        // tombstone; if we only seeded for parents-of-current-mergeable-cids,
+        // the gate would be silently empty and the child would register.
+        let map_cids: Vec<ContainerID> = self
+            .store
+            .iter_all_container_ids()
+            .filter(|id| matches!(id.container_type(), ContainerType::Map))
+            .collect();
+
+        // Pass 2: for each map cid, walk its value table and collect every
+        // `MapValue { value: None }` entry as a (parent_cid, key, idlp)
+        // tombstone-seed candidate. Materialize before mutating to avoid
+        // holding an iterator borrow across the seeding loop.
+        let mut tombstones_to_seed: Vec<(ContainerID, InternalString, IdLp)> = Vec::new();
+        for parent_id in &map_cids {
+            let Some(parent_idx) = self.arena.id_to_idx(parent_id) else {
+                continue;
+            };
+            let Some(state) = self.store.get_container(parent_idx) else {
+                continue;
+            };
+            let Some(map_state) = state.as_map_state() else {
+                continue;
+            };
+
+            for (key, mv) in map_state.iter() {
+                if mv.value.is_none() {
+                    tombstones_to_seed.push((parent_id.clone(), key.clone(), mv.idlp()));
+                }
+            }
+        }
+
+        // Pass 3: write the seeds. `set_mergeable_tombstone` is monotonic-max, so duplicates
+        // and out-of-order entries are handled correctly even if a single (parent, key) had
+        // multiple `None`-valued history entries.
+        for (parent_id, key, idlp) in tombstones_to_seed {
+            let Some(parent_idx) = self.arena.id_to_idx(&parent_id) else {
+                continue;
+            };
+            if let Some(state) = self.store.get_container_mut(parent_idx) {
+                if let Some(map_state) = state.as_map_state_mut() {
+                    map_state.set_mergeable_tombstone(key, idlp);
+                }
+            }
+        }
+
+        // Pass 4: register mergeable cids. `register_mergeable_children` logic
+        // consults the just-seeded tombstones; cids whose max-op IdLp is
+        // dominated by a tombstone are filtered out before LWW selection.
         let mergeable: Vec<ContainerID> = self
             .store
             .iter_all_container_ids()
