@@ -156,6 +156,66 @@ fn undo_manager_reverts_mergeable_counter_mutation() {
 }
 
 
+/// Mergeable Roots have a deterministic `ContainerID::Root` in a reserved namespace,
+/// but they are conceptually parented to a regular Map. The top-level root enumeration
+/// (driven by `DocState::preferred_root_containers`, surfaced through
+/// `LoroDoc::get_value`) must NOT include the synthetic mergeable Root — otherwise
+/// the doc would expose a top-level key with a `🤝:...` hex name alongside the real
+/// roots.
+///
+/// This guards the `id.is_mergeable()` skip in `preferred_root_containers` against
+/// accidental removal: without it, peers would see two top-level entries (the actual
+/// parent map plus the synthetic mergeable root) instead of one.
+#[test]
+#[cfg(feature = "counter")]
+fn top_level_root_enumeration_skips_mergeable_roots() {
+    use loro_common::MERGEABLE_NAMESPACE_PREFIX;
+
+    let doc = doc(1);
+    let root = doc.get_map("state");
+    let counter = root.get_mergeable_counter("revision").unwrap();
+    counter.increment(1.0).unwrap();
+    doc.commit_then_renew();
+
+    // Sanity: the mergeable cid carries the synthetic namespace prefix.
+    let mergeable_cid = counter.id();
+    assert!(mergeable_cid.is_mergeable());
+
+    // `get_value()` returns a Map keyed by top-level root names. The mergeable cid's
+    // synthetic Root name (🤝:<hex>) must NOT appear here.
+    let top_level = doc.get_value().to_json_value();
+    let map = top_level
+        .as_object()
+        .expect("top-level doc value must be a JSON object");
+    let keys: Vec<&str> = map.keys().map(|s| s.as_str()).collect();
+    assert!(
+        keys.iter().any(|k| *k == "state"),
+        "real parent root 'state' must appear in top-level enumeration; got {keys:?}"
+    );
+    assert!(
+        keys.iter().all(|k| !k.starts_with(MERGEABLE_NAMESPACE_PREFIX)),
+        "no mergeable-namespace Root name must appear at the top level; got {keys:?}"
+    );
+    // Even more strictly: the synthetic root's exact name must not be a top-level key.
+    let synthetic_name = match &mergeable_cid {
+        loro_common::ContainerID::Root { name, .. } => name.to_string(),
+        _ => unreachable!("mergeable cid is always a Root"),
+    };
+    assert!(
+        !keys.iter().any(|k| *k == synthetic_name),
+        "synthetic mergeable root name {synthetic_name:?} must not be in top-level keys {keys:?}"
+    );
+
+    // Deep value must show the mergeable child nested under its logical parent, not as a
+    // sibling top-level entry.
+    assert_eq!(
+        doc.get_deep_value().to_json_value(),
+        json!({ "state": { "revision": 1.0 } }),
+        "mergeable child must be nested under its logical parent, not surfaced at the top level"
+    );
+}
+
+
 /// `LoroDoc::has_container(cid)` must return `false` for a mergeable cid
 /// that has never been written to, and `true` after the child has been
 /// mutated. Mergeable existence depends on state, not on the name shape, so
